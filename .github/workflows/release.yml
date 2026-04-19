@@ -59,52 +59,20 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # macOS: explicitly import the Developer ID cert into a temp keychain
-      # before building. Relying on electron-builder's CSC_LINK auto-import is
-      # unreliable; doing it ourselves fails loudly if the secret is malformed.
+      # macOS: import the Developer ID cert into an ephemeral keychain.
+      # apple-actions/import-codesign-certs handles Keychain-Access legacy p12s,
+      # ephemeral keychain creation, partition-list wiring, and cleanup on
+      # post-job — all the fiddly bits we were hand-rolling.
       - name: Import Developer ID certificate
         if: matrix.os == 'macos-latest'
-        env:
-          MAC_CERTIFICATE: ${{ secrets.MAC_CERTIFICATE }}
-          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
-        run: |
-          set -euo pipefail
+        uses: apple-actions/import-codesign-certs@v3
+        with:
+          p12-file-base64: ${{ secrets.MAC_CERTIFICATE }}
+          p12-password: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
 
-          CERT_PATH="$RUNNER_TEMP/cert.p12"
-          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
-          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
-
-          echo -n "$MAC_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
-          echo "Imported cert size: $(wc -c < "$CERT_PATH") bytes"
-
-          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
-          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
-
-          security import "$CERT_PATH" -P "$MAC_CERTIFICATE_PASSWORD" \
-            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
-
-          # Verify a codesigning identity actually landed in the keychain.
-          # `security import` returns 0 even on wrong p12 password, so we must
-          # explicitly check — otherwise the build "succeeds" but ships unsigned.
-          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -c "valid identities found" || true)
-          COUNT=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/valid identities found/ {print $1}')
-          echo "Keychain identity count: ${COUNT:-0}"
-          if [ "${COUNT:-0}" = "0" ]; then
-            echo "::error::No codesigning identity imported — MAC_CERTIFICATE_PASSWORD likely wrong or MAC_CERTIFICATE isn't a valid Developer ID Application .p12."
-            exit 1
-          fi
-
-          security set-key-partition-list -S "apple-tool:,apple:,codesign:" \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
-
-          # Prepend our temp keychain to the search list so codesign finds it.
-          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
-
-          echo "Codesigning identities available:"
-          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
-
-          rm -f "$CERT_PATH"
+      - name: Verify codesigning identity
+        if: matrix.os == 'macos-latest'
+        run: security find-identity -v -p codesigning
 
       - name: Build macOS (signed + notarized)
         if: matrix.os == 'macos-latest'
