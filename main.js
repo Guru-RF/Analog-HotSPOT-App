@@ -1,6 +1,10 @@
-const { app, BrowserWindow, ipcMain, Tray, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
+
+// Force the menu-bar / About / Quit labels to "HotSpot" regardless of the npm
+// package `name`. Must run before app.whenReady().
+app.setName("HotSpot");
 
 let mainWindow;
 let tray = null;
@@ -138,7 +142,15 @@ function createTray() {
       width: 16, height: 16, scaleFactor: 2.0,
     });
     tray = new Tray(icon);
-    tray.setToolTip("HotSpot");
+    tray.setToolTip("HotSpot — not connected");
+    rebuildTrayMenu({ connected: false });
+
+    // Left-click (macOS) → show / focus the window
+    tray.on("click", () => {
+      if (!mainWindow) return;
+      if (!mainWindow.isVisible()) mainWindow.show();
+      mainWindow.focus();
+    });
   } catch (e) {
     console.warn("Tray creation failed:", e.message);
   }
@@ -148,7 +160,7 @@ app.whenReady().then(() => {
   if (process.platform === "darwin" && app.dock) {
     try {
       const dockIcon = nativeImage.createFromPath(
-        path.join(__dirname, "build", "icon-512.png")
+        path.join(__dirname, "build", "icon.png")
       );
       if (!dockIcon.isEmpty()) app.dock.setIcon(dockIcon);
     } catch (_) {}
@@ -185,18 +197,91 @@ ipcMain.on("ble:preferred-name", (_event, name) => {
   preferredBleName = name || "";
 });
 
-// Tray ticker — macOS: menu bar text, Windows: balloon notifications
+// Tray ticker + dropdown — macOS: current talker shows next to the tray icon
+// in the menu bar; right-click opens a menu with live state and actions.
+// Windows: balloon notifications on new talker + the same dropdown menu.
 let prevTalkerText = "";
-ipcMain.on("tray:talkers", (_event, text) => {
+
+function rebuildTrayMenu(state) {
   if (!tray) return;
-  if (process.platform === "darwin") tray.setTitle(text || "");
-  tray.setToolTip(text ? `Talking: ${text}` : "HotSpot");
-  if (process.platform === "win32" && text && text !== prevTalkerText) {
+  const { connected, cs, tk, ltk, tg, talkgroups } = state || {};
+  const dash = "\u2014";
+
+  const template = [];
+  if (connected) {
+    template.push(
+      { label: `HotSpot: ${cs || dash}`, enabled: false },
+      { label: `TG ${tg || dash}`, enabled: false },
+      { type: "separator" },
+      { label: `Current: ${tk || dash}`, enabled: false },
+      { label: `Last: ${ltk || dash}`, enabled: false },
+    );
+
+    // Talkgroup quick-switch submenu. Clicking sends `91<tg>#` via DTMF,
+    // same convention as the in-app TG bar.
+    if (Array.isArray(talkgroups) && talkgroups.length) {
+      template.push(
+        { type: "separator" },
+        {
+          label: "Switch talkgroup",
+          submenu: talkgroups.map((t) => ({
+            label: t.label ? `${t.tg} — ${t.label}` : t.tg,
+            type: "checkbox",
+            checked: String(tg || "") === String(t.tg),
+            click: () => {
+              if (!mainWindow || mainWindow.isDestroyed()) return;
+              mainWindow.webContents.send("ble:send-dtmf", `91${t.tg}#`);
+            },
+          })),
+        },
+      );
+    }
+  } else {
+    template.push({ label: "Not connected", enabled: false });
+  }
+  template.push(
+    { type: "separator" },
+    {
+      label: "Show HotSpot",
+      click: () => {
+        if (!mainWindow) return;
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.focus();
+      },
+    },
+    { label: "Quit HotSpot", role: "quit" },
+  );
+
+  tray.setContextMenu(Menu.buildFromTemplate(template));
+}
+
+ipcMain.on("tray:state", (_event, state) => {
+  if (!tray) return;
+  const { connected, tk, ltk } = state || {};
+
+  // Menu bar title: only show the active talker's callsign. Blank when nobody
+  // is keying or when we're disconnected — avoids a constant "·" next to the icon.
+  if (process.platform === "darwin") tray.setTitle(connected && tk ? tk : "");
+
+  tray.setToolTip(
+    !connected
+      ? "HotSpot — not connected"
+      : tk
+        ? `Talking: ${tk}`
+        : ltk
+          ? `Last: ${ltk}`
+          : "HotSpot",
+  );
+
+  // Windows toast: only when a *new* talker keys up
+  if (process.platform === "win32" && tk && tk !== prevTalkerText) {
     tray.displayBalloon({
       title: "HotSpot",
-      content: `Talking: ${text}`,
+      content: `Talking: ${tk}`,
       iconType: "info",
     });
   }
-  prevTalkerText = text || "";
+  prevTalkerText = tk || "";
+
+  rebuildTrayMenu(state);
 });

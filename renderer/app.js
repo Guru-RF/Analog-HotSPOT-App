@@ -224,6 +224,10 @@ function renderFeed() {
   });
 }
 
+// Whenever the TG list changes (config save / startup), push the new list
+// to the tray so the context menu stays in sync.
+function refreshTrayTgs() { updateTray(); }
+
 function renderTgBar() {
   if (!tgBarButtonsEl) return;
   const tgs = Object.keys(state.talkgroupInfo || {})
@@ -282,8 +286,22 @@ function renderTable() {
 }
 
 function updateTray() {
-  const tk = (state.feed?.tk || "").toString().trim();
-  try { window.api.updateTrayTalkers(tk); } catch {}
+  const f = state.feed || {};
+  const talkgroups = Object.keys(state.talkgroupInfo || {})
+    .map((k) => k.trim())
+    .filter(Boolean)
+    .sort((a, b) => Number(a) - Number(b))
+    .map((tg) => ({ tg, label: state.talkgroupInfo[tg] || "" }));
+  try {
+    window.api.updateTrayState({
+      connected: !!state.bleConnected,
+      cs:  (f.cs  || "").toString().trim(),
+      tk:  (f.tk  || "").toString().trim(),
+      ltk: (f.ltk || "").toString().trim(),
+      tg:  (f.tg  || "").toString().trim(),
+      talkgroups,
+    });
+  } catch {}
 }
 
 // ── BLE client ────────────────────────────────────────────────────────────────
@@ -351,6 +369,8 @@ function setBleStatus(text, cls) {
     state.feed = {};
     renderFeed();
   }
+  // Always push the new connection state to the tray
+  updateTray();
 
   // Show/hide the TG quick-dial bar with connection state
   if (tgBarEl) {
@@ -654,6 +674,7 @@ function applyConfig(cfg) {
   document.title = cfg.title || "HotSpot";
   state.talkgroupInfo = normalizeTgInfo(cfg.talkgroupInfo || {});
   renderTgBar();
+  refreshTrayTgs();
 }
 
 function initSettings() {
@@ -717,6 +738,11 @@ async function main() {
   initTitleBar();
   initSettings();
   initBLE();
+
+  // Tray-menu TG clicks — main process asks us to send a DTMF string.
+  try {
+    window.api.onSendDtmfRequest?.((dtmf) => bleSendDTMF(dtmf));
+  } catch {}
 
   state.history = loadHistory();
   state.historyLimit = loadHistoryLimit();
