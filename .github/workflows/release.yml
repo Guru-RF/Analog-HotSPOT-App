@@ -59,16 +59,21 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Build
-        # electron-builder reads CSC_LINK / CSC_KEY_PASSWORD for macOS code
-        # signing and APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
-        # for notarization. On non-mac runners these are simply ignored.
+      # macOS-only: sign + notarize via electron-builder env vars. We expose
+      # these only on the mac runner; on Windows/Linux CSC_LINK would otherwise
+      # be interpreted as a Windows signing cert and fail the build.
+      - name: Build macOS (signed + notarized)
+        if: matrix.os == 'macos-latest'
         env:
           CSC_LINK: ${{ secrets.MAC_CERTIFICATE }}
           CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run ${{ matrix.script }} -- --publish never
+
+      - name: Build (unsigned)
+        if: matrix.os != 'macos-latest'
         run: npm run ${{ matrix.script }} -- --publish never
 
       - name: Upload artifacts to release

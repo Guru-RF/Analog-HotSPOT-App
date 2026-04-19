@@ -27,7 +27,7 @@
       ],
       "category": "public.app-category.utilities",
       "icon": "build/icon-512.png",
-      "identity": "Developer ID Application: BVBA WeePee (PTFT4U8MF9)",
+      "identity": "BVBA WeePee (PTFT4U8MF9)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
