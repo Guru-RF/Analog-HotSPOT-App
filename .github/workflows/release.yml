@@ -1,0 +1,77 @@
+name: Build & Release
+
+# Push a tag like v1.0.0 to trigger a full release build.
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  # ── Stage 1: create the GitHub Release with release notes ──────────────────
+  create-release:
+    name: Create Release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+
+  # ── Stage 2: build each platform and upload artifacts ─────────────────────
+  build:
+    name: Build — ${{ matrix.name }}
+    needs: create-release
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: macOS
+            os: macos-latest
+            script: build:mac
+            artifacts: dist/*.dmg
+
+          - name: Windows
+            os: windows-latest
+            script: build:win
+            artifacts: dist/*.exe
+
+          - name: Linux
+            os: ubuntu-latest
+            script: build:linux
+            artifacts: dist/*.AppImage
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        # electron-builder reads CSC_LINK / CSC_KEY_PASSWORD for macOS code
+        # signing and APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID
+        # for notarization. On non-mac runners these are simply ignored.
+        env:
+          CSC_LINK: ${{ secrets.MAC_CERTIFICATE }}
+          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: npm run ${{ matrix.script }} -- --publish never
+
+      - name: Upload artifacts to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ matrix.artifacts }}

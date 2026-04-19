@@ -1,0 +1,23 @@
+node_modules/
+dist/
+.DS_Store
+*.log
+
+# Editor / tooling state
+.claude/
+.trunk/
+.vscode/
+.idea/
+
+# Local secrets — signing certs, app-specific passwords, env files.
+# Never commit any of these.
+*.p12
+*.pem
+*.key
+*.keychain
+*.provisionprofile
+.env
+.env.*
+
+# Stray root tray icon (the real one lives in build/)
+/tray-icon.png

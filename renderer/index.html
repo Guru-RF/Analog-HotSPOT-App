@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <title>HotSpot</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body>
+
+    <!-- Custom title bar -->
+    <div id="titlebar">
+      <div id="titlebar-drag">
+        <span class="titlebar-appname" id="title">HotSpot</span>
+        <span id="titlebar-status">Not connected</span>
+      </div>
+      <div id="titlebar-controls">
+        <button class="tb-btn" id="btn-ble-quickconnect" title="Reconnect to saved HotSpot" style="display:none">&#x21BB;</button>
+        <button class="tb-btn" id="btn-settings" title="Settings">&#9881;</button>
+        <button class="tb-btn" id="btn-ontop" title="Always on top">&#8902;</button>
+        <button class="tb-btn" id="btn-minimize" title="Minimize">&#8211;</button>
+        <button class="tb-btn close" id="btn-close" title="Close">&#10005;</button>
+      </div>
+    </div>
+
+    <!-- Settings modal -->
+    <div id="settings-overlay" class="hidden" role="dialog" aria-modal="true">
+      <div id="settings-modal">
+        <div id="settings-modal-header">
+          <span class="settings-modal-title">Settings</span>
+          <button class="tb-btn close" id="btn-cancel-settings" title="Close">&#10005;</button>
+        </div>
+        <div class="settings-modal-body">
+
+          <div class="settings-section">Display</div>
+
+          <div class="settings-row settings-row-inline">
+            <label>Dark mode</label>
+            <label class="switch" title="Toggle light/dark">
+              <input id="themeToggle" type="checkbox" />
+              <span class="slider"></span>
+            </label>
+          </div>
+
+          <div class="settings-section">Bluetooth (HotSpot)</div>
+
+          <div class="settings-row settings-row-inline">
+            <label>Status</label>
+            <span id="ble-status">Not connected</span>
+          </div>
+
+          <div class="settings-row settings-row-inline">
+            <label>HotSpot</label>
+            <div class="ble-controls">
+              <button class="btn-ghost" id="btn-ble-connect">Scan &amp; Connect</button>
+              <button class="btn-ghost" id="btn-ble-disconnect" style="display:none">Disconnect</button>
+            </div>
+          </div>
+
+          <div class="settings-section">General</div>
+
+          <div class="settings-row">
+            <label for="input-app-title">App Title</label>
+            <input
+              type="text"
+              id="input-app-title"
+              placeholder="HotSpot"
+              spellcheck="false"
+              autocomplete="off"
+            />
+          </div>
+
+          <div class="settings-row">
+            <label for="history-limit">History</label>
+            <select id="history-limit">
+              <option value="20">20 talkers</option>
+              <option value="50" selected>50 talkers</option>
+              <option value="100">100 talkers</option>
+              <option value="200">200 talkers</option>
+            </select>
+          </div>
+
+          <div class="settings-row">
+            <label for="input-tg-info">Talkgroups JSON</label>
+            <textarea
+              id="input-tg-info"
+              rows="6"
+              placeholder='{"51":"Talkgroup 1","9000":"145.7 VHF Gent"}'
+              spellcheck="false"
+            ></textarea>
+          </div>
+
+        </div>
+        <div class="settings-actions">
+          <button class="btn-ghost" id="btn-clear-history">Clear History</button>
+          <button class="btn-ghost" id="btn-restore-defaults">Restore Defaults</button>
+          <button class="btn-primary" id="btn-save-settings">Save</button>
+        </div>
+      </div>
+    </div>
+
+    <!-- DTMF bar (only visible when BLE is connected) -->
+    <div id="dtmf-bar" style="display:none">
+      <input
+        id="dtmf-input"
+        type="text"
+        placeholder="DTMF (0-9, A-D, *, #)"
+        maxlength="64"
+        spellcheck="false"
+        autocomplete="off"
+      />
+      <button class="btn-primary" id="dtmf-send">Send</button>
+      <button class="btn-ghost dtmf-quick" data-dtmf="9*#" title="List talkgroups">TG</button>
+      <button class="btn-ghost dtmf-quick" data-dtmf="*#" title="Status">Status</button>
+      <button class="btn-ghost dtmf-quick" data-dtmf="D911#" title="Announce IP address">IP</button>
+      <button class="btn-ghost dtmf-quick" data-dtmf="D1#" title="Parrot test">Parrot</button>
+      <select id="ble-cmd-select" title="HotSpot commands">
+        <option value="" disabled selected>&#9881; Command&hellip;</option>
+        <option value="svxlink-start">SVXLink Start</option>
+        <option value="svxlink-stop">SVXLink Stop</option>
+        <option value="svxlink-restart">SVXLink Restart</option>
+        <option value="4g-enable">4G Enable</option>
+        <option value="4g-disable">4G Disable</option>
+        <option value="reboot">Reboot</option>
+        <option value="poweroff">Power Off</option>
+      </select>
+      <span id="dtmf-response"></span>
+    </div>
+
+    <!-- Talkgroup quick-dial bar (only visible when BLE is connected) -->
+    <div id="tg-bar" style="display:none">
+      <span class="tg-bar-label">TG</span>
+      <div id="tg-bar-buttons"></div>
+    </div>
+
+    <!-- Main content -->
+    <main>
+
+      <!-- HotSpot state panel -->
+      <section id="hotspot-card">
+        <div class="hs-row hs-row-top">
+          <div class="hs-id">
+            <span class="hs-label">HotSpot</span>
+            <span class="hs-cs" id="hs-cs">&mdash;</span>
+          </div>
+          <div class="hs-flags">
+            <span class="flag" id="flag-rx" title="RF carrier (squelch)">RX</span>
+            <span class="flag" id="flag-tx" title="Transmitter">TX</span>
+          </div>
+        </div>
+
+        <div class="hs-row hs-grid">
+          <div class="hs-cell">
+            <span class="hs-label">Frequency</span>
+            <span class="hs-val" id="hs-fq">&mdash;</span>
+          </div>
+          <div class="hs-cell">
+            <span class="hs-label">Talkgroup</span>
+            <span class="hs-val" id="hs-tg">&mdash;</span>
+          </div>
+          <div class="hs-cell">
+            <span class="hs-label">IP</span>
+            <span class="hs-val mono" id="hs-ip">&mdash;</span>
+          </div>
+        </div>
+
+        <div class="hs-active" id="hs-active">
+          <span class="hs-active-dot"></span>
+          <span class="hs-active-label">Active talker</span>
+          <span class="hs-active-cs" id="hs-tk">&mdash;</span>
+        </div>
+      </section>
+
+      <!-- Last talkers list -->
+      <section class="tableFrame">
+        <table aria-label="Last talkers">
+          <thead>
+            <tr>
+              <th class="narrow center"></th>
+              <th>Callsign</th>
+              <th>Talkgroup</th>
+              <th class="center">Duration</th>
+              <th class="center">&#x1F552;</th>
+            </tr>
+          </thead>
+          <tbody id="tbody"></tbody>
+        </table>
+      </section>
+
+    </main>
+
+    <!-- Footer -->
+    <footer class="site-footer">
+      <div class="footer-row">
+        <span>
+          Coded by
+          <a href="https://www.qrz.com/db/ON6URE" target="_blank" rel="noopener noreferrer">ON6URE</a>
+        </span>
+        <span>
+          Hosted by
+          <a href="https://rf.guru" target="_blank" rel="noopener noreferrer">rf.guru</a>
+        </span>
+      </div>
+    </footer>
+
+    <script src="./app.js"></script>
+  </body>
+</html>
