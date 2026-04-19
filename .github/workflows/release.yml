@@ -83,8 +83,20 @@ jobs:
 
           security import "$CERT_PATH" -P "$MAC_CERTIFICATE_PASSWORD" \
             -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+
+          # Verify a codesigning identity actually landed in the keychain.
+          # `security import` returns 0 even on wrong p12 password, so we must
+          # explicitly check — otherwise the build "succeeds" but ships unsigned.
+          IDENTITIES=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | grep -c "valid identities found" || true)
+          COUNT=$(security find-identity -v -p codesigning "$KEYCHAIN_PATH" | awk '/valid identities found/ {print $1}')
+          echo "Keychain identity count: ${COUNT:-0}"
+          if [ "${COUNT:-0}" = "0" ]; then
+            echo "::error::No codesigning identity imported — MAC_CERTIFICATE_PASSWORD likely wrong or MAC_CERTIFICATE isn't a valid Developer ID Application .p12."
+            exit 1
+          fi
+
           security set-key-partition-list -S "apple-tool:,apple:,codesign:" \
-            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH" >/dev/null
 
           # Prepend our temp keychain to the search list so codesign finds it.
           security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
