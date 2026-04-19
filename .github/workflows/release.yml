@@ -59,14 +59,44 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      # macOS-only: sign + notarize via electron-builder env vars. We expose
-      # these only on the mac runner; on Windows/Linux CSC_LINK would otherwise
-      # be interpreted as a Windows signing cert and fail the build.
+      # macOS: explicitly import the Developer ID cert into a temp keychain
+      # before building. Relying on electron-builder's CSC_LINK auto-import is
+      # unreliable; doing it ourselves fails loudly if the secret is malformed.
+      - name: Import Developer ID certificate
+        if: matrix.os == 'macos-latest'
+        env:
+          MAC_CERTIFICATE: ${{ secrets.MAC_CERTIFICATE }}
+          MAC_CERTIFICATE_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+        run: |
+          set -euo pipefail
+
+          CERT_PATH="$RUNNER_TEMP/cert.p12"
+          KEYCHAIN_PATH="$RUNNER_TEMP/build.keychain-db"
+          KEYCHAIN_PASSWORD="$(openssl rand -base64 24)"
+
+          echo -n "$MAC_CERTIFICATE" | base64 --decode -o "$CERT_PATH"
+          echo "Imported cert size: $(wc -c < "$CERT_PATH") bytes"
+
+          security create-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+          security set-keychain-settings -lut 3600 "$KEYCHAIN_PATH"
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          security import "$CERT_PATH" -P "$MAC_CERTIFICATE_PASSWORD" \
+            -A -t cert -f pkcs12 -k "$KEYCHAIN_PATH"
+          security set-key-partition-list -S "apple-tool:,apple:,codesign:" \
+            -s -k "$KEYCHAIN_PASSWORD" "$KEYCHAIN_PATH"
+
+          # Prepend our temp keychain to the search list so codesign finds it.
+          security list-keychains -d user -s "$KEYCHAIN_PATH" $(security list-keychains -d user | tr -d '"')
+
+          echo "Codesigning identities available:"
+          security find-identity -v -p codesigning "$KEYCHAIN_PATH"
+
+          rm -f "$CERT_PATH"
+
       - name: Build macOS (signed + notarized)
         if: matrix.os == 'macos-latest'
         env:
-          CSC_LINK: ${{ secrets.MAC_CERTIFICATE }}
-          CSC_KEY_PASSWORD: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
