@@ -37,7 +37,6 @@ npm run build:linux  # Linux .AppImage (x64 + arm64)
 
 ## Credits
 
-Concept by [ON8ST](https://www.qrz.com/db/ON8ST),  
 coded by [ON6URE](https://www.qrz.com/db/ON6URE).
 
 Hosted by [rf.guru](https://rf.guru).
