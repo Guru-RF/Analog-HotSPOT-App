@@ -3,6 +3,7 @@
    ============================================================ */
 
 :root {
+  color-scheme: light;
   --bg: #ffffff;
   --fg: #0f172a;
   --muted: #64748b;
@@ -19,6 +20,7 @@
 }
 
 [data-theme="dark"] {
+  color-scheme: dark;
   --bg: #0b1220;
   --fg: #e6e8ee;
   --muted: #9aa3b2;
@@ -196,6 +198,17 @@ body {
   font: 13px/1.4 system-ui, sans-serif;
   outline: none;
   user-select: text;
+}
+
+/* Native <select> popups follow the app theme. Without color-scheme,
+   Chromium on Windows would paint option text on a white background
+   inside the dropdown popup even in dark mode. */
+select { color-scheme: light dark; }
+[data-theme="dark"] select,
+[data-theme="dark"] option {
+  color-scheme: dark;
+  background-color: #1b2538;
+  color: #e6e8ee;
 }
 .settings-row textarea {
   font-family: "Consolas", "SF Mono", "Monaco", monospace;
