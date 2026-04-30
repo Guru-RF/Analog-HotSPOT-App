@@ -432,7 +432,43 @@ main {
   letter-spacing: 0.5px;
 }
 
-.hs-flags { display: flex; gap: 6px; }
+.hs-flags { display: flex; gap: 6px; align-items: center; }
+
+/* 4G/LTE signal meter (fed by BLE feed `sg` field — modem RSSI in dBm).
+   Levels: ≥-70 excellent (4), -85..-70 good (3), -100..-85 fair (2),
+   -110..-100 weak (1), <-110 very poor (1, red). */
+#signal-meter {
+  display: inline-flex;
+  align-items: flex-end;
+  gap: 2px;
+  height: 14px;
+  width: 18px;
+  flex-shrink: 0;
+  cursor: help;
+}
+#signal-meter .bar {
+  flex: 1;
+  background: var(--border);
+  border-radius: 1px;
+  transition: background 0.2s;
+}
+#signal-meter .bar:nth-child(1) { height: 30%; }
+#signal-meter .bar:nth-child(2) { height: 55%; }
+#signal-meter .bar:nth-child(3) { height: 80%; }
+#signal-meter .bar:nth-child(4) { height: 100%; }
+
+#signal-meter[data-level="1"] .bar:nth-child(-n+1),
+#signal-meter[data-level="2"] .bar:nth-child(-n+2),
+#signal-meter[data-level="3"] .bar:nth-child(-n+3),
+#signal-meter[data-level="4"] .bar:nth-child(-n+4) {
+  background: var(--ok);
+}
+/* Mid-range fairness gets a warm tint */
+#signal-meter[data-level="2"] .bar:nth-child(-n+2) { background: var(--hotspot); }
+/* Weak — single bar in warm */
+#signal-meter[data-level="1"] .bar:nth-child(1) { background: var(--hotspot); }
+/* Below −110 dBm: red */
+#signal-meter.very-poor .bar:nth-child(1) { background: var(--bad); }
 .flag {
   font-size: 11px;
   font-weight: 800;

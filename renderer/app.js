@@ -198,6 +198,33 @@ function trimHistory() {
 }
 
 // ── Rendering ─────────────────────────────────────────────────────────────────
+// 4G/LTE signal meter — buckets per Analog-HotSPOT-SVXLink/BLE.md (modem RSSI):
+//   ≥-70 excellent (4 bars), -85..-70 good (3), -100..-85 fair (2),
+//   -110..-100 weak (1), <-110 very poor (1, red).
+function updateSignalMeter(sg) {
+  const meter = document.getElementById("signal-meter");
+  if (!meter) return;
+  if (sg === "" || sg == null) {
+    meter.style.display = "none";
+    return;
+  }
+  const dbm = Number(sg);
+  if (!Number.isFinite(dbm)) {
+    meter.style.display = "none";
+    return;
+  }
+  let level, label;
+  if (dbm >= -70)        { level = 4; label = "excellent"; }
+  else if (dbm >= -85)   { level = 3; label = "good"; }
+  else if (dbm >= -100)  { level = 2; label = "fair"; }
+  else if (dbm >= -110)  { level = 1; label = "weak"; }
+  else                   { level = 1; label = "very poor"; }
+  meter.style.display = "";
+  meter.dataset.level = String(level);
+  meter.classList.toggle("very-poor", dbm < -110);
+  meter.title = `4G signal: ${dbm} dBm (${label})`;
+}
+
 function renderFeed() {
   const f = state.feed || {};
   hsCsEl.textContent = f.cs || "\u2014";
@@ -216,6 +243,8 @@ function renderFeed() {
   flagRxEl.classList.toggle("rx", Number(f.rx) === 1);
   flagTxEl.classList.toggle("on", Number(f.tx) === 1);
   flagTxEl.classList.toggle("tx", Number(f.tx) === 1);
+
+  updateSignalMeter(f.sg);
 
   // Highlight the TG button matching the hotspot's current talkgroup
   const active = (f.tg || "").toString().trim();
@@ -368,6 +397,7 @@ function setBleStatus(text, cls) {
     // Wipe live feed view when disconnected, but keep history
     state.feed = {};
     renderFeed();
+    updateSignalMeter("");
   }
   // Always push the new connection state to the tray
   updateTray();
