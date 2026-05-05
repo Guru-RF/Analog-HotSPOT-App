@@ -7,6 +7,12 @@ Built with [Electron](https://www.electronjs.org/), available for **macOS**, **W
 
 ---
 
+## Setup
+
+**No system pairing required.** Don't add the hotspot in your operating system's Bluetooth settings — BLE GATT scanning happens inside the app and the hotspot's service won't appear in the OS Bluetooth panel. All you need is **Bluetooth turned on** and the hotspot powered up nearby.
+
+To connect or change preferences, click the ⚙ **gear icon** in the app's title bar — that opens the Settings panel where you can scan for the hotspot, edit the talkgroup list, change the app title, etc. The first successful connection is remembered and the app will silently reconnect on every subsequent launch.
+
 ## Features
 
 - BLE GATT client for the hotspot's Feed/DTMF/Command/Status characteristics (see [BLE.md](../Analog-HotSPOT-SVXLink/BLE.md))
