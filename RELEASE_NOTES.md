@@ -18,6 +18,11 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 
 | Platform | Format |
 | --- | --- |
-| macOS (Apple Silicon + Intel) | `.dmg` — signed & notarized |
+| macOS Apple Silicon | `HotSpot-<ver>-AppleSilicon.dmg` — signed & notarized |
+| macOS Intel | `HotSpot-<ver>-Intel.dmg` — signed & notarized |
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
+
+## What's new in 1.0.4
+
+- macOS DMGs are now named `HotSpot-<ver>-AppleSilicon.dmg` / `HotSpot-<ver>-Intel.dmg` so it's clear which one to download.
