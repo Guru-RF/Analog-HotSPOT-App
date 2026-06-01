@@ -97,8 +97,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          DEBUG: electron-builder
-        timeout-minutes: 25
+          DEBUG: "electron-builder,electron-osx-sign,@electron/osx-sign,@electron/notarize"
+        timeout-minutes: 15
         run: npm run ${{ matrix.script }} -- --publish never
 
       - name: Build (unsigned)
