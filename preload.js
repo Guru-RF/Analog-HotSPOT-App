@@ -26,4 +26,9 @@ contextBridge.exposeInMainWorld("api", {
   // Tray → renderer: request to send a DTMF string (e.g. "91<tg>#") over BLE
   onSendDtmfRequest: (cb) =>
     ipcRenderer.on("ble:send-dtmf", (_e, dtmf) => cb(dtmf)),
+
+  // Update available pill
+  onUpdateAvailable: (cb) =>
+    ipcRenderer.on("update:available", (_e, info) => cb(info)),
+  openUpdateUrl: () => ipcRenderer.send("update:open"),
 });

@@ -971,3 +971,23 @@ main.sp-body {
   background: var(--panel);
   flex-shrink: 0;
 }
+
+/* ============================================================
+   "Update available" pill in the title bar
+   ============================================================ */
+
+.update-pill {
+  background: #d92929;
+  color: #ffffff;
+  border: 0;
+  border-radius: 999px;
+  padding: 3px 10px;
+  margin: 0 6px 0 2px;
+  font: 700 11px/1.2 system-ui, sans-serif;
+  letter-spacing: 0.3px;
+  text-transform: uppercase;
+  cursor: pointer;
+  -webkit-app-region: no-drag;
+  transition: background 0.12s;
+}
+.update-pill:hover { background: #b21f1f; }

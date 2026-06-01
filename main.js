@@ -222,6 +222,57 @@ function clampBoundsToDisplay(bounds, defaults) {
   return { x: Math.round(x), y: Math.round(y), width: cw, height: ch };
 }
 
+// ── Update check ──────────────────────────────────────────────────────────────
+// Poll GitHub's "latest release" endpoint at startup and once a day after.
+// If the tag (stripped of its leading "v") is higher than app.getVersion(),
+// the renderer is told to show a red "update available" pill in the title
+// bar. Click → main process opens the landing page in the system browser.
+const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
+const UPDATE_RELEASES_URL = "https://api.github.com/repos/Guru-RF/Analog-HotSPOT-App/releases/latest";
+const UPDATE_LANDING_URL = "https://svxlink-hotspot.app";
+
+function isNewerVersion(remote, local) {
+  const pa = String(remote).split(".").map((n) => Number(n) || 0);
+  const pb = String(local).split(".").map((n) => Number(n) || 0);
+  const len = Math.max(pa.length, pb.length);
+  for (let i = 0; i < len; i++) {
+    const a = pa[i] || 0;
+    const b = pb[i] || 0;
+    if (a !== b) return a > b;
+  }
+  return false;
+}
+
+async function checkForUpdates() {
+  try {
+    const res = await fetch(UPDATE_RELEASES_URL, {
+      headers: {
+        "User-Agent": "HotSpot-Desktop-App",
+        "Accept": "application/vnd.github+json",
+      },
+    });
+    if (!res.ok) return;
+    const json = await res.json();
+    const latest = String(json.tag_name || "").replace(/^v/, "").trim();
+    if (!latest) return;
+    const current = app.getVersion();
+    if (!isNewerVersion(latest, current)) return;
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("update:available", {
+        version: latest,
+        url: UPDATE_LANDING_URL,
+      });
+    }
+  } catch (_) {}
+}
+
+function startUpdateChecking() {
+  // Slight delay so the renderer's IPC listener is registered before the
+  // first broadcast fires.
+  setTimeout(checkForUpdates, 5000);
+  setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+}
+
 function createSettingsWindow() {
   if (settingsWindow && !settingsWindow.isDestroyed()) {
     // If it's hiding on another macOS Space, this hauls it onto the active
@@ -311,6 +362,14 @@ app.whenReady().then(() => {
   }
   createWindow();
   createTray();
+  startUpdateChecking();
+});
+
+// Renderer asks us to open the landing page when the user clicks the
+// update pill. URL is hardcoded so the renderer can't be tricked into
+// asking us to open an arbitrary site.
+ipcMain.on("update:open", () => {
+  shell.openExternal(UPDATE_LANDING_URL).catch(() => {});
 });
 
 app.on("window-all-closed", () => {

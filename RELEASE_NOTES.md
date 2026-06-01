@@ -23,6 +23,11 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.7
+
+- **Update notifier.** The app polls GitHub's `releases/latest` for `Guru-RF/Analog-HotSPOT-App` at startup and once a day after. When a newer tag appears, a red `vX.Y.Z available` pill shows in the title bar — click it to open <https://svxlink-hotspot.app>.
+- **Windows ARM64 build** alongside the existing x64 installer (`HotSpot-Setup-x64.exe` and `HotSpot-Setup-arm64.exe`).
+
 ## What's new in 1.0.6
 
 - **Feature parity with the mobile app.** Tab navigation (Home / Map / Info / Reflector), full reflector WSS feed with `snapshot` / `node_upsert` / `talk_start` / `talk_stop` handling, OpenStreetMap-based Map tab via vendored Leaflet, Info tab with monitored TGs and CTCSS mappings, live reflector talker list.

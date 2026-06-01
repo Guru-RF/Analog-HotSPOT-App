@@ -1444,6 +1444,18 @@ function initTitleBar() {
     if (v) btnOnTop.classList.add("active");
     else btnOnTop.classList.remove("active");
   });
+
+  // Update pill — main process polls GitHub daily and pushes this event
+  // when a newer release tag is available. Click opens the download page.
+  const updateBtn = document.getElementById("btn-update");
+  const updateLabel = document.getElementById("update-pill-label");
+  window.api.onUpdateAvailable?.((info) => {
+    if (!updateBtn) return;
+    if (updateLabel) updateLabel.textContent = `v${info.version} available`;
+    updateBtn.title = `New version ${info.version} — click to open ${info.url || "the download page"}`;
+    updateBtn.style.display = "";
+  });
+  updateBtn?.addEventListener("click", () => window.api.openUpdateUrl?.());
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
