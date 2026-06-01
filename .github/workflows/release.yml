@@ -98,7 +98,10 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
           DEBUG: "electron-builder,electron-osx-sign,@electron/osx-sign,@electron/notarize"
-        timeout-minutes: 15
+        # Codesign by itself runs in ~4 min (verified by the sign-only
+        # diagnostic). The extra budget here is for Apple's notary queue,
+        # which can take 30+ min for a brand-new team's first submission.
+        timeout-minutes: 60
         run: npm run ${{ matrix.script }} -- --publish never
 
       - name: Build (unsigned)
