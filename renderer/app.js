@@ -19,9 +19,7 @@ const BLE_CMD_UUID    = "6b1d6a13-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_FEED_UUID   = "6b1d6a14-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_CCCD_UUID   = "00002902-0000-1000-8000-00805f9b34fb";
 
-const THEME_KEY          = "ahs-app-theme";
 const HISTORY_KEY        = "ahs-app-talker-history-v1";
-const HISTORY_LIMIT_KEY  = "ahs-app-history-limit";
 const BLE_LAST_DEVICE    = "ahs-app-ble-last-device";
 const SCREEN_KEY         = "ahs-app-screen";
 
@@ -36,20 +34,8 @@ const DEFAULT_HOME_RADIUS_KM    = 150;
 const titleEl = document.getElementById("title");
 const titlebarStatusEl = document.getElementById("titlebar-status");
 const tbody = document.getElementById("tbody");
-const themeToggleEl = document.getElementById("themeToggle");
-const inputAppTitle = document.getElementById("input-app-title");
-const inputTgInfo = document.getElementById("input-tg-info");
-const historyLimitEl = document.getElementById("history-limit");
 const tgBarEl = document.getElementById("tg-bar");
 const tgBarButtonsEl = document.getElementById("tg-bar-buttons");
-
-const inputReflectorDomain = document.getElementById("input-reflector-domain");
-const reflectorProbeResult = document.getElementById("reflector-probe-result");
-const wssToggleEl = document.getElementById("wssToggle");
-const tgAutoUpdateToggleEl = document.getElementById("tgAutoUpdateToggle");
-const inputHomeLat = document.getElementById("input-home-lat");
-const inputHomeLng = document.getElementById("input-home-lng");
-const inputHomeRadius = document.getElementById("input-home-radius");
 
 const hsCsEl = document.getElementById("hs-cs");
 const hsFqEl = document.getElementById("hs-fq");
@@ -60,7 +46,6 @@ const hsActiveEl = document.getElementById("hs-active");
 const flagRxEl = document.getElementById("flag-rx");
 const flagTxEl = document.getElementById("flag-tx");
 
-const settingsPanelEl = document.getElementById("settings-overlay");
 const reflectorStatusEl = document.getElementById("reflector-status");
 const reflectorTbody = document.getElementById("reflector-tbody");
 
@@ -168,32 +153,9 @@ function saveHistory() {
   } catch {}
 }
 
-function loadHistoryLimit() {
-  try {
-    const v = Number(localStorage.getItem(HISTORY_LIMIT_KEY));
-    if (Number.isFinite(v) && v > 0) return v;
-  } catch {}
-  return 50;
-}
-
-function saveHistoryLimit(v) {
-  try { localStorage.setItem(HISTORY_LIMIT_KEY, String(v)); } catch {}
-}
-
 // ── Theme ─────────────────────────────────────────────────────────────────────
 function applyTheme(dark) {
   document.documentElement.setAttribute("data-theme", dark ? "dark" : "light");
-  if (themeToggleEl) themeToggleEl.checked = dark;
-  try { localStorage.setItem(THEME_KEY, dark ? "dark" : "light"); } catch {}
-}
-
-function initTheme() {
-  let dark = true;
-  try {
-    const stored = localStorage.getItem(THEME_KEY);
-    if (stored === "light") dark = false;
-  } catch {}
-  applyTheme(dark);
 }
 
 // ── Feed handling ─────────────────────────────────────────────────────────────
@@ -521,11 +483,14 @@ function setBleStatus(text, cls) {
   const connected = cls === "connected";
   state.bleConnected = connected;
 
+  // Always offer a way to scan when we're not connected — saved or not. On a
+  // fresh install with no saved name we'd otherwise have no manual entry point
+  // now that Settings lives in its own window.
   const quick = document.getElementById("btn-ble-quickconnect");
   if (quick) {
     const saved = getSavedDeviceName();
-    quick.style.display = !connected && saved ? "" : "none";
-    quick.title = saved ? `Reconnect to ${saved}` : "Reconnect";
+    quick.style.display = connected ? "none" : "";
+    quick.title = saved ? `Reconnect to ${saved}` : "Scan for HotSpot";
   }
 
   const bar = document.getElementById("dtmf-bar");
@@ -830,10 +795,16 @@ function reflectorReset() {
 
 function reflectorSetDomain(domain, enabled) {
   const d = String(domain || "").trim();
+  const next = !!enabled;
+  // Idempotent — applyConfig() is invoked on every settings:changed
+  // broadcast (which the TG auto-update also fires), and a stale "reset +
+  // reconnect" would kick a healthy WSS off its already-open connection,
+  // looping forever on transient close codes.
+  if (d === state.reflector.domain && next === state.reflector.enabled) return;
   state.reflector.domain = d;
-  state.reflector.enabled = !!enabled;
+  state.reflector.enabled = next;
   reflectorReset();
-  if (!d || !enabled) return;
+  if (!d || !next) return;
   reflectorConnect();
 }
 
@@ -1140,22 +1111,6 @@ async function probeReflectorWss(domain) {
   });
 }
 
-async function reflectorProbe() {
-  if (!reflectorProbeResult) return;
-  const domain = (inputReflectorDomain?.value || "").trim();
-  if (!domain) { reflectorProbeResult.textContent = "Enter a domain first."; reflectorProbeResult.className = "settings-hint bad"; return; }
-  reflectorProbeResult.textContent = "Probing…";
-  reflectorProbeResult.className = "settings-hint";
-  const wssOk = await probeReflectorWss(domain);
-  const tgUrl = portalTalkgroupsUrlFor(domain);
-  const tg = await fetchTalkgroupsFromUrl(tgUrl);
-  const parts = [];
-  parts.push(wssOk ? "✓ WSS" : "✗ WSS");
-  parts.push(tg ? `✓ talkgroups (${Object.keys(tg).length})` : "✗ talkgroups");
-  reflectorProbeResult.textContent = parts.join("  ");
-  reflectorProbeResult.className = "settings-hint " + (wssOk && tg ? "ok" : "bad");
-}
-
 // Schedule talkgroup auto-refresh — fires immediately, then every 8 h.
 function rescheduleTgAutoUpdate() {
   if (tgUpdateTimer) { clearInterval(tgUpdateTimer); tgUpdateTimer = null; }
@@ -1165,13 +1120,19 @@ function rescheduleTgAutoUpdate() {
   if (!url) return;
   const tick = async () => {
     const fetched = await fetchTalkgroupsFromUrl(url);
-    if (fetched && Object.keys(fetched).length) {
-      state.talkgroupInfo = fetched;
-      state.cfg = { ...state.cfg, talkgroupInfo: fetched };
+    if (!fetched || !Object.keys(fetched).length) return;
+    // Only persist when the data actually changed — otherwise we get
+    // settings:changed → applyConfig → rescheduleTgAutoUpdate → tick →
+    // save again, churning the WSS connection and re-fetching forever.
+    const before = JSON.stringify(state.talkgroupInfo || {});
+    const after = JSON.stringify(fetched);
+    state.talkgroupInfo = fetched;
+    state.cfg = { ...state.cfg, talkgroupInfo: fetched };
+    renderTgBar();
+    renderInfo();
+    refreshTrayTgs();
+    if (before !== after) {
       window.api.saveSettings({ talkgroupInfo: fetched }).catch(() => {});
-      renderTgBar();
-      renderInfo();
-      refreshTrayTgs();
     }
   };
   tick();
@@ -1256,12 +1217,9 @@ function ensureMap() {
   mapState.markersLayer = L.layerGroup().addTo(mapState.map);
   mapState.initialized = true;
 
-  // Click to set home QTH
-  mapState.map.on("click", (e) => {
-    setHomeLatLng(e.latlng.lat, e.latlng.lng, /*persist*/ true);
-  });
-
-  fitMapInitial();
+  // refitMap() handles the "open map while someone is already qualified"
+  // case — it zooms to the talker(s) instead of dropping you back at home.
+  refitMap();
   renderMap();
 }
 
@@ -1269,8 +1227,6 @@ function setHomeLatLng(lat, lng, persist) {
   if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
   state.cfg = { ...state.cfg, homeLat: lat, homeLng: lng };
   if (persist) window.api.saveSettings({ homeLat: lat, homeLng: lng }).catch(() => {});
-  if (inputHomeLat) inputHomeLat.value = lat.toFixed(5);
-  if (inputHomeLng) inputHomeLng.value = lng.toFixed(5);
   updateHomeMarker();
   document.getElementById("btn-map-center")?.removeAttribute("disabled");
 }
@@ -1323,7 +1279,94 @@ function fitToHome(lat, lng, radiusKm) {
   mapState.map.fitBounds(bounds, { padding: [40, 40] });
 }
 
+// ── Talker map auto-zoom (matches SVXConnect-iOS) ─────────────────────────
+// A station has to be on-air for 1.5 s before its location earns a camera
+// move — short PTT hits don't drag the map around. When the qualified set
+// changes, the camera re-fits to all qualified talkers (~20 km radius for
+// a single station, bounding box for multiple) and returns to the home
+// view once everyone has dropped.
+const TALKER_QUALIFY_MS = 1500;
+const TALKER_ZOOM_RADIUS_KM = 20;
+const talkerQual = new Map(); // callsign → { timer, qualified }
+
+function collectQualifiedTalkers() {
+  const out = [];
+  for (const [cs, q] of talkerQual) {
+    if (!q.qualified) continue;
+    const n = state.reflector.nodes.get(cs);
+    if (n && n.lat != null && n.lon != null) out.push(n);
+  }
+  return out;
+}
+
+function fitToTalkers(talkers) {
+  if (!mapState.map || !talkers.length) return;
+  if (talkers.length === 1) {
+    fitToHome(talkers[0].lat, talkers[0].lon, TALKER_ZOOM_RADIUS_KM);
+    return;
+  }
+  const bounds = L.latLngBounds(talkers.map((n) => [n.lat, n.lon]));
+  mapState.map.fitBounds(bounds, { padding: [40, 40] });
+}
+
+function refitMap() {
+  if (!mapState.map) return;
+  const qualified = collectQualifiedTalkers();
+  if (qualified.length) fitToTalkers(qualified);
+  else fitMapInitial();
+}
+
+function updateTalkerQualifications() {
+  const active = new Set();
+  for (const n of state.reflector.nodes.values()) {
+    if (n.isTalker && n.lat != null && n.lon != null) active.add(n.callsign);
+  }
+  // Drop entries for stations that stopped — and remember if any of them
+  // were already qualified, because losing a qualified talker means the
+  // camera should re-fit (back to home if the qualified set is now empty).
+  let droppedQualified = false;
+  for (const [cs, q] of talkerQual) {
+    if (active.has(cs)) continue;
+    if (q.timer) clearTimeout(q.timer);
+    if (q.qualified) droppedQualified = true;
+    talkerQual.delete(cs);
+  }
+  // Arm a 1.5 s qualifier on newly-active stations. If they're still on
+  // the air when the timer fires, mark them qualified and re-fit.
+  for (const cs of active) {
+    if (talkerQual.has(cs)) continue;
+    const entry = { timer: null, qualified: false };
+    entry.timer = setTimeout(() => {
+      entry.timer = null;
+      const n = state.reflector.nodes.get(cs);
+      if (!n || !n.isTalker) return;
+      entry.qualified = true;
+      refitMap();
+    }, TALKER_QUALIFY_MS);
+    talkerQual.set(cs, entry);
+  }
+  if (droppedQualified) refitMap();
+}
+
+// Classify a reflector node into a SVXConnect-iOS badge type.
+//   - AI       — callsign contains "/" (slash-suffixed mobile/portable; the
+//                feed always reports these offline so this check sits ABOVE
+//                the offline branch).
+//   - OFFLINE  — node.online === false and not slash-suffixed.
+//   - REPEATER — callsign starts with "ON0" (Belgian repeater convention).
+//   - NODE     — everything else.
+function nodeBadge(n) {
+  if (n.callsign.includes("/"))   return { label: "AI",       bg: "#2D9CDB" };
+  if (!n.online)                  return { label: "OFFLINE",  bg: "#8C8C8C" };
+  if (n.callsign.startsWith("ON0")) return { label: "REPEATER", bg: "#36C58D" };
+  return { label: "NODE", bg: "#FFA600" };
+}
+
 function renderMap() {
+  // Talker qualification runs even when the map view hasn't been opened
+  // yet — that way, by the time the user switches to the Map tab, the
+  // 1.5 s timers already reflect what's on the air.
+  updateTalkerQualifications();
   if (!mapState.map || !mapState.markersLayer) return;
   mapState.markersLayer.clearLayers();
   const nodes = Array.from(state.reflector.nodes.values()).filter((n) => n.lat != null && n.lon != null);
@@ -1339,13 +1382,19 @@ function renderMap() {
       weight: isTalker ? 2 : 1,
     });
     const monitored = n.monitoredTGs?.length ? `Monitors: ${n.monitoredTGs.join(", ")}` : "";
+    const badge = nodeBadge(n);
+    const badgeHtml = `<span class="map-badge" style="background:${badge.bg}">${badge.label}</span>`;
+    const talkingHtml = isTalker ? `<span class="map-badge map-badge-talking">TALKING</span>` : "";
+    const tgLabel = n.tg && state.talkgroupInfo[String(n.tg)] ? ` — ${escapeHtml(state.talkgroupInfo[String(n.tg)])}` : "";
     const html = `
       <div class="map-popup">
-        <div class="map-popup-cs">${escapeHtml(n.callsign)}</div>
-        <div class="map-popup-loc">${escapeHtml(n.location || "")}</div>
-        ${n.tg ? `<div class="map-popup-tg">TG ${n.tg}</div>` : ""}
+        <div class="map-popup-head">
+          <span class="map-popup-cs">${escapeHtml(n.callsign)}</span>
+          ${badgeHtml}${talkingHtml}
+        </div>
+        ${n.location ? `<div class="map-popup-loc">${escapeHtml(n.location)}</div>` : ""}
+        ${n.tg ? `<div class="map-popup-tg">TG ${n.tg}${tgLabel}</div>` : ""}
         ${monitored ? `<div class="map-popup-mt">${escapeHtml(monitored)}</div>` : ""}
-        <div class="map-popup-state">${isTalker ? "Talking" : (n.online ? "Online" : "Offline")}</div>
       </div>`;
     marker.bindPopup(html);
     marker.addTo(mapState.markersLayer);
@@ -1357,7 +1406,7 @@ function initMapButtons() {
   document.getElementById("btn-map-home")?.addEventListener("click", async () => {
     if (!navigator.geolocation) {
       const hint = document.getElementById("map-hint");
-      if (hint) hint.textContent = "Geolocation unavailable — click the map instead.";
+      if (hint) hint.textContent = "Geolocation unavailable — set the address in Settings.";
       return;
     }
     navigator.geolocation.getCurrentPosition(
@@ -1367,7 +1416,7 @@ function initMapButtons() {
       },
       (err) => {
         const hint = document.getElementById("map-hint");
-        if (hint) hint.textContent = `No GPS fix (${err.message || "denied"}). Click the map to set home.`;
+        if (hint) hint.textContent = `No GPS fix (${err.message || "denied"}). Set the address in Settings.`;
       },
       { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 }
     );
@@ -1398,29 +1447,6 @@ function initTitleBar() {
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
-function openSettings() {
-  if (!settingsPanelEl) return;
-  const cfg = state.cfg || {};
-  if (inputAppTitle) inputAppTitle.value = cfg.title || "";
-  if (historyLimitEl) historyLimitEl.value = String(state.historyLimit);
-  if (inputTgInfo) {
-    const tg = state.talkgroupInfo;
-    inputTgInfo.value = tg && Object.keys(tg).length ? JSON.stringify(tg, null, 2) : "";
-  }
-  if (inputReflectorDomain) inputReflectorDomain.value = cfg.reflectorDomain || "";
-  if (wssToggleEl) wssToggleEl.checked = cfg.wssEnabled !== false;
-  if (tgAutoUpdateToggleEl) tgAutoUpdateToggleEl.checked = !!cfg.tgAutoUpdate;
-  if (inputHomeLat) inputHomeLat.value = cfg.homeLat != null ? String(cfg.homeLat) : "";
-  if (inputHomeLng) inputHomeLng.value = cfg.homeLng != null ? String(cfg.homeLng) : "";
-  if (inputHomeRadius) inputHomeRadius.value = cfg.homeRadiusKm != null ? String(cfg.homeRadiusKm) : String(DEFAULT_HOME_RADIUS_KM);
-  if (reflectorProbeResult) { reflectorProbeResult.textContent = ""; reflectorProbeResult.className = "settings-hint"; }
-  settingsPanelEl.classList.remove("hidden");
-}
-
-function closeSettings() {
-  settingsPanelEl?.classList.add("hidden");
-}
-
 function normalizeTgInfo(obj) {
   const out = {};
   for (const [k, v] of Object.entries(obj || {})) {
@@ -1434,11 +1460,14 @@ function applyConfig(cfg) {
   state.cfg = cfg;
   if (titleEl && cfg.title) titleEl.textContent = cfg.title;
   document.title = cfg.title || "HotSpot";
+  applyTheme(cfg.theme !== "light");
   state.talkgroupInfo = normalizeTgInfo(cfg.talkgroupInfo || {});
+  state.historyLimit = Number(cfg.historyLimit) > 0 ? Number(cfg.historyLimit) : 50;
   renderTgBar();
   refreshTrayTgs();
   renderInfo();
   renderMap();
+  renderTable();
 
   // Reflector / WSS
   reflectorSetDomain(cfg.reflectorDomain || "", cfg.wssEnabled !== false);
@@ -1447,89 +1476,13 @@ function applyConfig(cfg) {
 
 function initSettings() {
   document.getElementById("btn-settings")?.addEventListener("click", () => {
-    if (settingsPanelEl?.classList.contains("hidden")) openSettings();
-    else closeSettings();
+    window.api.openSettingsWindow();
   });
-  settingsPanelEl?.addEventListener("click", (e) => {
-    if (e.target === settingsPanelEl) closeSettings();
-  });
-  document.getElementById("btn-cancel-settings")?.addEventListener("click", closeSettings);
+  // Main window listens for save broadcasts so the settings window can stay
+  // simple (it just calls saveSettings and closes itself).
+  window.api.onSettingsChanged?.((cfg) => applyConfig(cfg));
 
-  document.getElementById("btn-restore-defaults")?.addEventListener("click", async () => {
-    const defaults = await window.api.getDefaults();
-    if (inputAppTitle) inputAppTitle.value = defaults.title || "";
-    if (historyLimitEl) historyLimitEl.value = "50";
-    if (inputTgInfo) {
-      const tg = defaults.talkgroupInfo;
-      inputTgInfo.value = tg && Object.keys(tg).length ? JSON.stringify(tg, null, 2) : "";
-    }
-    if (inputReflectorDomain) inputReflectorDomain.value = defaults.reflectorDomain || "";
-    if (wssToggleEl) wssToggleEl.checked = defaults.wssEnabled !== false;
-    if (tgAutoUpdateToggleEl) tgAutoUpdateToggleEl.checked = !!defaults.tgAutoUpdate;
-    if (inputHomeLat) inputHomeLat.value = "";
-    if (inputHomeLng) inputHomeLng.value = "";
-    if (inputHomeRadius) inputHomeRadius.value = String(defaults.homeRadiusKm || DEFAULT_HOME_RADIUS_KM);
-  });
-
-  document.getElementById("btn-clear-history")?.addEventListener("click", () => {
-    if (!confirm("Clear the talker history?")) return;
-    state.history = [];
-    state.currentSession = null;
-    saveHistory();
-    renderTable();
-  });
-
-  document.getElementById("btn-clear-home")?.addEventListener("click", () => {
-    if (inputHomeLat) inputHomeLat.value = "";
-    if (inputHomeLng) inputHomeLng.value = "";
-  });
-
-  document.getElementById("btn-reflector-probe")?.addEventListener("click", reflectorProbe);
-
-  document.getElementById("btn-save-settings")?.addEventListener("click", async () => {
-    const title = (inputAppTitle?.value || "").trim() || "HotSpot";
-    const limit = Number(historyLimitEl?.value) || 50;
-
-    let talkgroupInfo = {};
-    try {
-      const raw = (inputTgInfo?.value || "").trim();
-      if (raw) talkgroupInfo = JSON.parse(raw);
-    } catch {
-      alert("Talkgroups JSON is not valid.");
-      return;
-    }
-
-    const reflectorDomain = (inputReflectorDomain?.value || "").trim();
-    const wssEnabled = !!(wssToggleEl?.checked);
-    const tgAutoUpdate = !!(tgAutoUpdateToggleEl?.checked);
-    const tgUpdateUrl = reflectorDomain ? portalTalkgroupsUrlFor(reflectorDomain) : "";
-
-    const latStr = (inputHomeLat?.value || "").trim();
-    const lngStr = (inputHomeLng?.value || "").trim();
-    const homeLat = latStr ? Number(latStr) : null;
-    const homeLng = lngStr ? Number(lngStr) : null;
-    const homeRadiusKm = Number(inputHomeRadius?.value) || DEFAULT_HOME_RADIUS_KM;
-
-    state.historyLimit = limit;
-    saveHistoryLimit(limit);
-
-    const newCfg = {
-      title, talkgroupInfo,
-      reflectorDomain, wssEnabled, tgAutoUpdate, tgUpdateUrl,
-      homeLat: Number.isFinite(homeLat) ? homeLat : null,
-      homeLng: Number.isFinite(homeLng) ? homeLng : null,
-      homeRadiusKm,
-    };
-    await window.api.saveSettings(newCfg);
-    applyConfig({ ...state.cfg, ...newCfg });
-
-    closeSettings();
-    renderTable();
-  });
-
-  themeToggleEl?.addEventListener("change", () => applyTheme(themeToggleEl.checked));
-
-  // Info copy buttons (delegated)
+  // Info copy buttons (delegated).
   document.getElementById("info-grid")?.addEventListener("click", (e) => {
     const btn = e.target.closest(".info-copy[data-copy]");
     if (!btn) return;
@@ -1540,7 +1493,7 @@ function initSettings() {
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
-  initTheme();
+  // Theme/title/limit are applied via applyConfig() once settings load.
   initTitleBar();
   initTabBar();
   initSettings();
@@ -1552,8 +1505,6 @@ async function main() {
   } catch {}
 
   state.history = loadHistory();
-  state.historyLimit = loadHistoryLimit();
-  if (historyLimitEl) historyLimitEl.value = String(state.historyLimit);
 
   const cfg = await window.api.loadSettings();
   applyConfig(cfg);

@@ -1,0 +1,119 @@
+<!doctype html>
+<html lang="en" data-theme="dark">
+  <head>
+    <meta charset="utf-8" />
+    <title>HotSpot — Settings</title>
+    <meta name="viewport" content="width=device-width,initial-scale=1" />
+    <meta name="color-scheme" content="dark light" />
+    <link rel="stylesheet" href="./styles.css" />
+  </head>
+  <body class="settings-page">
+
+    <header class="sp-header">
+      <span class="sp-title">Settings</span>
+      <span class="sp-hint" id="sp-status"></span>
+    </header>
+
+    <main class="sp-body">
+
+      <div class="settings-section">Display</div>
+      <div class="settings-row settings-row-inline">
+        <label>Dark mode</label>
+        <label class="switch" title="Toggle light/dark">
+          <input id="themeToggle" type="checkbox" />
+          <span class="slider"></span>
+        </label>
+      </div>
+
+      <div class="settings-section">General</div>
+      <div class="settings-row">
+        <label for="input-app-title">App Title</label>
+        <input type="text" id="input-app-title" placeholder="HotSpot" spellcheck="false" autocomplete="off" />
+      </div>
+      <div class="settings-row">
+        <label for="history-limit">History</label>
+        <select id="history-limit">
+          <option value="20">20 talkers</option>
+          <option value="50" selected>50 talkers</option>
+          <option value="100">100 talkers</option>
+          <option value="200">200 talkers</option>
+        </select>
+      </div>
+
+      <div class="settings-section">Reflector (live feed)</div>
+      <div class="settings-row">
+        <label for="input-reflector-domain">Reflector domain</label>
+        <div class="row-inline-input">
+          <input type="text" id="input-reflector-domain" placeholder="be.svx.link" spellcheck="false" autocomplete="off" />
+          <button class="btn-ghost" id="btn-reflector-probe" title="Test WSS + talkgroups">Probe</button>
+        </div>
+        <span class="settings-hint" id="reflector-probe-result"></span>
+      </div>
+      <div class="settings-row settings-row-inline">
+        <label>Enable enhanced reflector feed</label>
+        <label class="switch"><input id="wssToggle" type="checkbox" /><span class="slider"></span></label>
+      </div>
+      <div class="settings-row settings-row-inline">
+        <label>Auto-update talkgroups</label>
+        <label class="switch"><input id="tgAutoUpdateToggle" type="checkbox" /><span class="slider"></span></label>
+      </div>
+
+      <div class="settings-section">Map / Home QTH</div>
+
+      <div class="settings-row">
+        <label for="input-home-street">Street &amp; nr</label>
+        <div class="row-inline-input">
+          <input type="text" id="input-home-street" placeholder="Street name" spellcheck="false" autocomplete="off" style="flex:3" />
+          <input type="text" id="input-home-number" placeholder="Nr" spellcheck="false" autocomplete="off" style="flex:1; min-width: 70px" />
+        </div>
+      </div>
+      <div class="settings-row">
+        <label for="input-home-zip">ZIP &amp; City</label>
+        <div class="row-inline-input">
+          <input type="text" id="input-home-zip" placeholder="ZIP" spellcheck="false" autocomplete="off" style="flex:1; min-width: 90px" />
+          <input type="text" id="input-home-city" placeholder="City" spellcheck="false" autocomplete="off" style="flex:3" />
+        </div>
+      </div>
+      <div class="settings-row">
+        <label for="input-home-country">Country</label>
+        <div class="row-inline-input">
+          <input type="text" id="input-home-country" placeholder="e.g. Belgium" spellcheck="false" autocomplete="off" />
+          <button class="btn-primary" id="btn-geo-lookup" title="Look up coordinates from this address">Lookup</button>
+        </div>
+        <span class="settings-hint" id="geo-lookup-result">Resolves via OpenStreetMap Nominatim.</span>
+      </div>
+
+      <div class="settings-row">
+        <label>Coordinates</label>
+        <div class="row-inline-input">
+          <input type="text" id="input-home-lat" placeholder="Latitude" spellcheck="false" autocomplete="off" inputmode="decimal" />
+          <input type="text" id="input-home-lng" placeholder="Longitude" spellcheck="false" autocomplete="off" inputmode="decimal" />
+          <button class="btn-ghost" id="btn-clear-home" title="Clear">&#10005;</button>
+        </div>
+        <span class="settings-hint">Filled in by Lookup, or enter coordinates directly.</span>
+      </div>
+
+      <div class="settings-row">
+        <label for="input-home-radius">Map radius (km)</label>
+        <input type="number" id="input-home-radius" min="10" max="2000" step="10" value="150" />
+      </div>
+
+      <div class="settings-section">Talkgroups</div>
+      <div class="settings-row">
+        <label for="input-tg-info">Talkgroups JSON</label>
+        <textarea id="input-tg-info" rows="6" placeholder='{"51":"Talkgroup 1","9000":"145.7 VHF Gent"}' spellcheck="false"></textarea>
+      </div>
+
+    </main>
+
+    <footer class="sp-actions">
+      <button class="btn-ghost" id="btn-clear-history">Clear History</button>
+      <button class="btn-ghost" id="btn-restore-defaults">Restore Defaults</button>
+      <span style="flex:1"></span>
+      <button class="btn-ghost" id="btn-cancel">Cancel</button>
+      <button class="btn-primary" id="btn-save">Save</button>
+    </footer>
+
+    <script src="./settings.js"></script>
+  </body>
+</html>

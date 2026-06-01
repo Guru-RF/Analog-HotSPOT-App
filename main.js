@@ -7,6 +7,7 @@ const fs = require("fs");
 app.setName("HotSpot");
 
 let mainWindow;
+let settingsWindow = null;
 let tray = null;
 let preferredBleName = "";
 
@@ -17,6 +18,10 @@ function getSettingsPath() {
 const DEFAULT_SETTINGS = {
   title: "HotSpot",
   alwaysOnTop: false,
+  // Settings window owns these too — keeping them in cfg makes the main and
+  // settings windows agree without needing a shared localStorage origin.
+  theme: "dark",          // "dark" | "light"
+  historyLimit: 50,
   talkgroupInfo: {
     "4": "4m Repeaters",
     "6": "6m Repeaters",
@@ -39,7 +44,13 @@ const DEFAULT_SETTINGS = {
   // Talkgroups auto-update via portal.<domain>/talkgroups.json
   tgAutoUpdate: false,
   tgUpdateUrl: "",
-  // Map / home QTH
+  // Map / home QTH — structured address kept alongside lat/lng so users can
+  // edit and re-geocode without losing what they typed.
+  homeStreet: "",
+  homeNumber: "",
+  homeZip: "",
+  homeCity: "",
+  homeCountry: "",
   homeLat: null,
   homeLng: null,
   homeRadiusKm: 150,
@@ -180,6 +191,92 @@ function createWindow() {
 
 }
 
+// Constrain a saved (x,y,w,h) bounds rectangle to whichever display can
+// actually fit it. Used when reopening Settings so a window that was last on
+// a now-disconnected monitor / a different macOS Space doesn't vanish — a
+// known gotcha when restoring window state across sessions.
+function clampBoundsToDisplay(bounds, defaults) {
+  const { screen } = require("electron");
+  if (!bounds || typeof bounds !== "object") return { ...defaults };
+  const w = Number.isFinite(bounds.width)  ? bounds.width  : defaults.width;
+  const h = Number.isFinite(bounds.height) ? bounds.height : defaults.height;
+  // If either x or y is missing, fall back to "centered on primary display".
+  const hasXY = Number.isFinite(bounds.x) && Number.isFinite(bounds.y);
+  if (!hasXY) {
+    const wa = screen.getPrimaryDisplay().workArea;
+    return { x: Math.round(wa.x + (wa.width - w) / 2), y: Math.round(wa.y + (wa.height - h) / 2), width: w, height: h };
+  }
+  const display = screen.getDisplayMatching({ x: bounds.x, y: bounds.y, width: w, height: h });
+  const wa = display.workArea;
+  // Pull at least 32px into the work area so the titlebar is always grabbable.
+  const minVisible = 32;
+  let x = bounds.x;
+  let y = bounds.y;
+  if (x + w < wa.x + minVisible) x = wa.x;
+  if (y + minVisible > wa.y + wa.height) y = wa.y;
+  if (x > wa.x + wa.width - minVisible) x = wa.x + wa.width - w;
+  if (y < wa.y) y = wa.y;
+  // Shrink if larger than the chosen display.
+  const cw = Math.min(w, wa.width);
+  const ch = Math.min(h, wa.height);
+  return { x: Math.round(x), y: Math.round(y), width: cw, height: ch };
+}
+
+function createSettingsWindow() {
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    // If it's hiding on another macOS Space, this hauls it onto the active
+    // one. On other platforms it just brings it to front.
+    if (process.platform === "darwin") {
+      settingsWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true });
+      settingsWindow.setVisibleOnAllWorkspaces(false);
+    }
+    if (settingsWindow.isMinimized()) settingsWindow.restore();
+    settingsWindow.show();
+    settingsWindow.focus();
+    return;
+  }
+  const defaults = { width: 620, height: 820 };
+  const savedCfg = loadSettings();
+  const bounds = clampBoundsToDisplay(savedCfg.settingsWindowBounds, defaults);
+  settingsWindow = new BrowserWindow({
+    ...bounds,
+    minWidth: 520,
+    minHeight: 600,
+    // Top-level (no `parent`) — a parented child window on macOS follows the
+    // parent across Spaces and can become unreachable. Independent window
+    // shows up in Mission Control / Cmd+~ like any other.
+    modal: false,
+    resizable: true,
+    minimizable: true,
+    maximizable: false,
+    fullscreenable: false,
+    title: "HotSpot — Settings",
+    backgroundColor: "#0b1220",
+    webPreferences: {
+      preload: path.join(__dirname, "preload.js"),
+      contextIsolation: true,
+      nodeIntegration: false,
+    },
+  });
+  settingsWindow.setMenuBarVisibility(false);
+  settingsWindow.loadFile(path.join(__dirname, "renderer", "settings.html"));
+
+  // Persist bounds so we can clamp + restore next time.
+  const persistBounds = () => {
+    if (!settingsWindow || settingsWindow.isDestroyed()) return;
+    try {
+      const b = settingsWindow.getBounds();
+      const current = loadSettings();
+      saveSettings({ ...current, settingsWindowBounds: b });
+    } catch (_) {}
+  };
+  settingsWindow.on("move",   persistBounds);
+  settingsWindow.on("resize", persistBounds);
+  settingsWindow.on("closed", () => { settingsWindow = null; });
+
+  if (!app.isPackaged) settingsWindow.webContents.openDevTools({ mode: "detach" });
+}
+
 function createTray() {
   if (process.platform === "linux") return;
   try {
@@ -222,9 +319,51 @@ app.on("window-all-closed", () => {
 
 ipcMain.handle("settings:load", () => loadSettings());
 ipcMain.handle("settings:defaults", () => ({ ...DEFAULT_SETTINGS }));
-ipcMain.handle("settings:save", (_event, settings) => {
+ipcMain.handle("settings:save", (_event, partial) => {
   const current = loadSettings();
-  saveSettings({ ...current, ...settings });
+  const updated = { ...current, ...partial };
+  saveSettings(updated);
+  // Live-broadcast to the main window so it can re-apply config without a
+  // restart. The settings window already has the data it sent up.
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("settings:changed", updated);
+  }
+  return updated;
+});
+
+ipcMain.on("settings:open-window", () => createSettingsWindow());
+ipcMain.on("settings:close-window", (e) => {
+  const w = BrowserWindow.fromWebContents(e.sender);
+  if (w && !w.isDestroyed()) w.close();
+});
+
+// Forward-geocode a freeform address via OpenStreetMap Nominatim.
+// Lives in the main process so we can set a proper User-Agent (browsers
+// block Renderer-side User-Agent overrides) and respect Nominatim policy.
+ipcMain.handle("geo:lookup", async (_e, query) => {
+  if (!query || typeof query !== "string") return null;
+  const q = query.trim();
+  if (!q) return null;
+  try {
+    const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=1`;
+    const res = await fetch(url, {
+      headers: {
+        "User-Agent": "HotSpot-Desktop-App/1.0 (+https://github.com/Guru-RF/Analog-HotSPOT-App)",
+        "Accept": "application/json",
+        "Accept-Language": "en",
+      },
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!Array.isArray(json) || !json.length) return null;
+    const top = json[0];
+    const lat = parseFloat(top.lat);
+    const lon = parseFloat(top.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    return { lat, lon, displayName: top.display_name || "" };
+  } catch (_) {
+    return null;
+  }
 });
 
 ipcMain.handle("window:toggleOnTop", () => {

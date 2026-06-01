@@ -1,7 +1,7 @@
 {
   "name": "hotspot-app",
   "productName": "HotSpot",
-  "version": "1.0.5",
+  "version": "1.0.6",
   "description": "HotSpot — Desktop App for Mac, Windows and Linux (BLE feed viewer)",
   "main": "main.js",
   "scripts": {
@@ -34,7 +34,7 @@
       "artifactName": "${productName}-${version}-${arch}.${ext}",
       "category": "public.app-category.utilities",
       "icon": "build/icon.icns",
-      "identity": "BVBA WeePee (PTFT4U8MF9)",
+      "identity": "Dielectricum (C4KY27CT2C)",
       "hardenedRuntime": true,
       "gatekeeperAssess": false,
       "entitlements": "build/entitlements.mac.plist",
