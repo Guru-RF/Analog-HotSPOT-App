@@ -133,12 +133,16 @@ jobs:
       # tight, predictable timeout.
       - name: Notarize and staple DMGs (parallel notarytool)
         if: matrix.os == 'macos-latest'
-        # Apple's notary queue runs 30–45 min for first-time submissions from
-        # a new team (verified empirically: history shows the 17:47 submission
-        # eventually went to Accepted, but only after the build had given up).
-        # Parallel `submit --wait` means both DMGs queue simultaneously, so
-        # wall-clock = slowest one, not the sum.
-        timeout-minutes: 60
+        # Apple's queue is sticking at 55–70 min per submission for our
+        # brand-new team. Even parallel submissions don't always finish
+        # together — v1.0.7's Intel cleared at 56 min while AppleSilicon
+        # was still pending at 60 min. 90 min covers the observed worst
+        # case; continue-on-error guarantees the upload step still runs
+        # even if a submission misses the window (we'll ship un-stapled,
+        # which still works via Gatekeeper's online check). The team
+        # builds reputation each clear, so this slack tightens over time.
+        timeout-minutes: 90
+        continue-on-error: true
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
