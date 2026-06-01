@@ -31,7 +31,7 @@
           ]
         }
       ],
-      "artifactName": "${productName}-${version}-${arch}.${ext}",
+      "artifactName": "${productName}-${arch}.${ext}",
       "category": "public.app-category.utilities",
       "icon": "build/icon.icns",
       "identity": "Dielectricum (C4KY27CT2C)",
@@ -54,6 +54,7 @@
           ]
         }
       ],
+      "artifactName": "${productName}-Setup.${ext}",
       "icon": "build/icon.png"
     },
     "linux": {
@@ -66,6 +67,7 @@
           ]
         }
       ],
+      "artifactName": "${productName}-${arch}.${ext}",
       "category": "Utility",
       "icon": "build/icon.png"
     }
