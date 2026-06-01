@@ -69,6 +69,23 @@ jobs:
         with:
           p12-file-base64: ${{ secrets.MAC_CERTIFICATE }}
           p12-password: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
+          keychain-password: github-runner-ephemeral
+
+      # The default partition-list `apple-tool:,apple:` is missing `codesign:`,
+      # which the v1.0.6 attempt was bitten by: signing hung for an hour with
+      # no log output because every codesign invocation was waiting on a
+      # never-arriving Keychain Access prompt. Forcing the entry plus a long
+      # unlock prevents that on ephemeral CI keychains.
+      - name: Grant unattended codesign access to private key
+        if: matrix.os == 'macos-latest'
+        run: |
+          KC=$(security list-keychains -d user | head -1 | xargs)
+          echo "Target keychain: $KC"
+          security unlock-keychain -p github-runner-ephemeral "$KC"
+          security set-keychain-settings -lut 21600 "$KC"
+          security set-key-partition-list \
+            -S 'apple-tool:,apple:,codesign:' \
+            -s -k github-runner-ephemeral "$KC"
 
       - name: Verify codesigning identity
         if: matrix.os == 'macos-latest'
@@ -80,6 +97,8 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          DEBUG: electron-builder
+        timeout-minutes: 25
         run: npm run ${{ matrix.script }} -- --publish never
 
       - name: Build (unsigned)
