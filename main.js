@@ -108,24 +108,51 @@ function createWindow() {
     return { action: "deny" };
   });
 
-  // Web Bluetooth picker — auto-select the last-paired device, or the first match.
+  // Web Bluetooth picker — auto-select the last-paired device, or the first
+  // match. requestDevice() already filtered by our service UUID, so anything
+  // in `devices` is a HotSpot-protocol peer — picking the first after a short
+  // grace period is safe even if the saved name doesn't show up (renamed box,
+  // a different unit at a club site, etc.). Without that fallback the picker
+  // would wait the full timeout and then cancel, hiding an in-range hotspot
+  // whose advertised name simply differs from the one we saw last time.
   let bleScanTimeout = null;
+  let bleFallbackTimeout = null;
   let bleCurrentCallback = null;
+  let bleLatestDevices = [];
+  const clearBleTimers = () => {
+    if (bleScanTimeout)     { clearTimeout(bleScanTimeout);     bleScanTimeout = null; }
+    if (bleFallbackTimeout) { clearTimeout(bleFallbackTimeout); bleFallbackTimeout = null; }
+  };
   mainWindow.webContents.on("select-bluetooth-device", (event, devices, callback) => {
     event.preventDefault();
     bleCurrentCallback = callback;
+    bleLatestDevices = devices;
     const preferred = preferredBleName;
     const exact = preferred && devices.find((d) => d.deviceName === preferred);
     if (exact) {
-      if (bleScanTimeout) { clearTimeout(bleScanTimeout); bleScanTimeout = null; }
+      clearBleTimers();
       bleCurrentCallback = null;
       return callback(exact.deviceId);
     }
     if (devices.length > 0 && !preferred) {
-      if (bleScanTimeout) { clearTimeout(bleScanTimeout); bleScanTimeout = null; }
+      clearBleTimers();
       bleCurrentCallback = null;
       return callback(devices[0].deviceId);
     }
+    // Saved name set but not (yet) seen: wait briefly in case it advertises
+    // late, then fall back to whatever HotSpot device is already visible.
+    if (devices.length > 0 && preferred && !bleFallbackTimeout) {
+      bleFallbackTimeout = setTimeout(() => {
+        bleFallbackTimeout = null;
+        const cb = bleCurrentCallback;
+        bleCurrentCallback = null;
+        if (!cb) return;
+        const list = bleLatestDevices;
+        const pick = (preferred && list.find((d) => d.deviceName === preferred)) || list[0];
+        try { cb(pick ? pick.deviceId : ""); } catch (_) {}
+      }, 3000);
+    }
+    // Hard cap: cancel after 15 s if we never see any device.
     if (!bleScanTimeout) {
       bleScanTimeout = setTimeout(() => {
         bleScanTimeout = null;
