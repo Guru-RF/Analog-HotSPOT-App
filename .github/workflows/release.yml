@@ -114,8 +114,8 @@ jobs:
           time xcrun notarytool history \
             --apple-id "$APPLE_ID" \
             --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" \
-            --output-format plain 2>&1 | head -30 || echo "history exit=$?"
+            --team-id "$APPLE_TEAM_ID" 2>&1 | head -30
+          echo "history exit=${PIPESTATUS[0]}"
 
       - name: Build macOS (signed + notarized)
         if: matrix.os == 'macos-latest'
