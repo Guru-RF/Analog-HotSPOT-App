@@ -117,18 +117,46 @@ jobs:
             --team-id "$APPLE_TEAM_ID" 2>&1 | head -30
           echo "history exit=${PIPESTATUS[0]}"
 
-      - name: Build macOS (signed + notarized)
+      - name: Build macOS (signed only — notarize comes after)
         if: matrix.os == 'macos-latest'
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
-          DEBUG: "electron-builder,electron-osx-sign,@electron/osx-sign,@electron/notarize"
-        # Codesign by itself runs in ~4 min (verified by the sign-only
-        # diagnostic). The extra budget here is for Apple's notary queue,
-        # which can take 30+ min for a brand-new team's first submission.
-        timeout-minutes: 60
+        timeout-minutes: 15
         run: npm run ${{ matrix.script }} -- --publish never
+
+      # electron-builder's notarize wait was hanging up to an hour even
+      # though `notarytool history` confirmed our submissions reached
+      # status:Accepted on Apple's side within a few minutes. Drive
+      # notarytool ourselves so we see every progress line and have a
+      # tight, predictable timeout.
+      - name: Notarize and staple DMGs (manual notarytool)
+        if: matrix.os == 'macos-latest'
+        timeout-minutes: 25
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          set -e
+          shopt -s nullglob
+          DMGS=(dist/*.dmg)
+          if [ ${#DMGS[@]} -eq 0 ]; then
+            echo "No DMGs found in dist/ — nothing to notarize." >&2
+            exit 1
+          fi
+          for dmg in "${DMGS[@]}"; do
+            echo "=== Notarizing: $dmg ==="
+            xcrun notarytool submit "$dmg" \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" \
+              --wait --verbose
+            echo "=== Stapling: $dmg ==="
+            xcrun stapler staple "$dmg"
+            xcrun stapler validate "$dmg"
+          done
 
       - name: Build (unsigned)
         if: matrix.os != 'macos-latest'
