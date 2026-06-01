@@ -91,6 +91,32 @@ jobs:
         if: matrix.os == 'macos-latest'
         run: security find-identity -v -p codesigning
 
+      # Pre-flight: hit Apple's notary service with the SAME credentials
+      # `notarytool submit` will use, but a cheap call that returns in a few
+      # seconds. Three outcomes tell us where the previous hang lives:
+      #  - returns history → credentials and network are fine, hang is the
+      #    upload itself or an electron-builder issue
+      #  - "Authentication failed" → APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
+      #    APPLE_TEAM_ID is wrong (most likely the app-specific password)
+      #  - hangs past timeout → DNS / firewall / Apple service issue
+      - name: Pre-flight notarize credentials test
+        if: matrix.os == 'macos-latest'
+        timeout-minutes: 3
+        env:
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        run: |
+          echo "APPLE_ID length: ${#APPLE_ID}"
+          echo "APPLE_TEAM_ID length: ${#APPLE_TEAM_ID}"
+          echo "APPLE_APP_SPECIFIC_PASSWORD length: ${#APPLE_APP_SPECIFIC_PASSWORD}"
+          echo "Calling notarytool history…"
+          time xcrun notarytool history \
+            --apple-id "$APPLE_ID" \
+            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+            --team-id "$APPLE_TEAM_ID" \
+            --output-format plain 2>&1 | head -30 || echo "history exit=$?"
+
       - name: Build macOS (signed + notarized)
         if: matrix.os == 'macos-latest'
         env:
