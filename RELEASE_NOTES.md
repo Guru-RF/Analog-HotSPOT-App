@@ -23,6 +23,10 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.5
+
+- **Fix crash on macOS 26 (Tahoe).** Upgraded Electron 33 → 42, which contains the V8 thread-isolation fix for Apple Silicon's TPRO memory-protection changes. Previous builds (≤ 1.0.4) crashed on launch with `EXC_BREAKPOINT` inside `v8::internal::ThreadIsolation::WriteProtectMemory` on macOS 26+.
+
 ## What's new in 1.0.4
 
 - macOS DMGs are now named `HotSpot-<ver>-AppleSilicon.dmg` / `HotSpot-<ver>-Intel.dmg` so it's clear which one to download.
