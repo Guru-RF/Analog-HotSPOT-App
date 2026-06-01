@@ -131,9 +131,14 @@ jobs:
       # status:Accepted on Apple's side within a few minutes. Drive
       # notarytool ourselves so we see every progress line and have a
       # tight, predictable timeout.
-      - name: Notarize and staple DMGs (manual notarytool)
+      - name: Notarize and staple DMGs (parallel notarytool)
         if: matrix.os == 'macos-latest'
-        timeout-minutes: 25
+        # Apple's notary queue runs 30–45 min for first-time submissions from
+        # a new team (verified empirically: history shows the 17:47 submission
+        # eventually went to Accepted, but only after the build had given up).
+        # Parallel `submit --wait` means both DMGs queue simultaneously, so
+        # wall-clock = slowest one, not the sum.
+        timeout-minutes: 60
         env:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
@@ -146,17 +151,32 @@ jobs:
             echo "No DMGs found in dist/ — nothing to notarize." >&2
             exit 1
           fi
-          for dmg in "${DMGS[@]}"; do
-            echo "=== Notarizing: $dmg ==="
+          notarize_one() {
+            local dmg="$1"
+            local tag="[$(basename "$dmg")]"
+            echo "$tag === Submitting + waiting ==="
             xcrun notarytool submit "$dmg" \
               --apple-id "$APPLE_ID" \
               --password "$APPLE_APP_SPECIFIC_PASSWORD" \
               --team-id "$APPLE_TEAM_ID" \
-              --wait --verbose
-            echo "=== Stapling: $dmg ==="
-            xcrun stapler staple "$dmg"
-            xcrun stapler validate "$dmg"
+              --wait 2>&1 | sed "s|^|$tag |"
+            echo "$tag === Stapling ==="
+            xcrun stapler staple "$dmg" 2>&1 | sed "s|^|$tag |"
+            xcrun stapler validate "$dmg" 2>&1 | sed "s|^|$tag |"
+          }
+          # Kick off both submissions in parallel; Apple processes them on
+          # independent slots, so we're only waiting once for the slowest.
+          pids=()
+          for dmg in "${DMGS[@]}"; do
+            notarize_one "$dmg" &
+            pids+=($!)
           done
+          # Fail the step if any background notarize fails.
+          status=0
+          for pid in "${pids[@]}"; do
+            wait "$pid" || status=$?
+          done
+          exit $status
 
       - name: Build (unsigned)
         if: matrix.os != 'macos-latest'
