@@ -3,11 +3,12 @@
 /**
  * HotSpot — Renderer
  *
- * Subscribes to the HotSpot's BLE "Feed" characteristic, parses JSON state,
- * renders the current state + a running list of last talkers.
+ * BLE GATT client for the hotspot's Feed / DTMF / Command / Status characteristics,
+ * plus a WSS reflector feed for the live talker/node map, and a tabbed UI
+ * (Home / Map / Info / Reflector) ported from the Flutter mobile app.
  *
- * Feed fields (see Analog-HotSPOT-SVXLink/BLE.md):
- *   ip, cs, fq, tg, tk (active talker), ltk (last talker), tx, rx
+ * Feed JSON fields (Analog-HotSPOT-SVXLink/BLE.md):
+ *   ip, cs, fq, ctx, tg, tk, ltk, tx, rx, sg, rf, mt, ct
  */
 
 // ── BLE UUIDs ─────────────────────────────────────────────────────────────────
@@ -16,11 +17,20 @@ const BLE_WRITE_UUID  = "6b1d6a11-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_STATUS_UUID = "6b1d6a12-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_CMD_UUID    = "6b1d6a13-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_FEED_UUID   = "6b1d6a14-c50f-4d86-a7f3-7f2a3a1b2c3d";
+const BLE_CCCD_UUID   = "00002902-0000-1000-8000-00805f9b34fb";
 
 const THEME_KEY          = "ahs-app-theme";
 const HISTORY_KEY        = "ahs-app-talker-history-v1";
 const HISTORY_LIMIT_KEY  = "ahs-app-history-limit";
 const BLE_LAST_DEVICE    = "ahs-app-ble-last-device";
+const SCREEN_KEY         = "ahs-app-screen";
+
+// Reflector / portal constants — match Flutter mobile app constants.dart.
+const TG_REFRESH_INTERVAL_MS    = 8 * 60 * 60 * 1000; // 8 h
+const REFLECTOR_RECONNECT_MS    = 15 * 1000;
+const REFLECTOR_SNAPSHOT_TO_MS  = 7 * 1000;
+const REFLECTOR_SESSION_LIMIT   = 200;
+const DEFAULT_HOME_RADIUS_KM    = 150;
 
 // ── DOM refs ─────────────────────────────────────────────────────────────────
 const titleEl = document.getElementById("title");
@@ -33,6 +43,14 @@ const historyLimitEl = document.getElementById("history-limit");
 const tgBarEl = document.getElementById("tg-bar");
 const tgBarButtonsEl = document.getElementById("tg-bar-buttons");
 
+const inputReflectorDomain = document.getElementById("input-reflector-domain");
+const reflectorProbeResult = document.getElementById("reflector-probe-result");
+const wssToggleEl = document.getElementById("wssToggle");
+const tgAutoUpdateToggleEl = document.getElementById("tgAutoUpdateToggle");
+const inputHomeLat = document.getElementById("input-home-lat");
+const inputHomeLng = document.getElementById("input-home-lng");
+const inputHomeRadius = document.getElementById("input-home-radius");
+
 const hsCsEl = document.getElementById("hs-cs");
 const hsFqEl = document.getElementById("hs-fq");
 const hsTgEl = document.getElementById("hs-tg");
@@ -43,16 +61,27 @@ const flagRxEl = document.getElementById("flag-rx");
 const flagTxEl = document.getElementById("flag-tx");
 
 const settingsPanelEl = document.getElementById("settings-overlay");
+const reflectorStatusEl = document.getElementById("reflector-status");
+const reflectorTbody = document.getElementById("reflector-tbody");
 
 // ── State ─────────────────────────────────────────────────────────────────────
 const state = {
   cfg: null,
-  feed: {},             // last parsed feed object
-  history: [],          // [{cs, tg, fq, startedAt, endedAt}] newest first
-  currentSession: null, // active talker session being accumulated
+  feed: {},
+  history: [],
+  currentSession: null,
   historyLimit: 50,
-  talkgroupInfo: {},    // {tgId: "label"}
+  talkgroupInfo: {},
   bleConnected: false,
+  activeScreen: "home",
+  // WSS reflector feed
+  reflector: {
+    domain: "",
+    enabled: false,
+    available: false,
+    nodes: new Map(),      // callsign → ReflectorNode
+    sessions: new Map(),   // session.id → ReflectorSession
+  },
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -67,7 +96,7 @@ function escapeHtml(s) {
 
 function msAgoLabel(deltaMs) {
   const s = Math.floor(deltaMs / 1000);
-  if (!Number.isFinite(s) || s < 0) return "\u2014";
+  if (!Number.isFinite(s) || s < 0) return "—";
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   if (m < 60) return `${m}m`;
@@ -75,12 +104,52 @@ function msAgoLabel(deltaMs) {
 }
 
 function durationLabel(ms) {
-  if (!Number.isFinite(ms) || ms < 0) return "\u2014";
+  if (!Number.isFinite(ms) || ms < 0) return "—";
   const s = Math.round(ms / 1000);
   if (s < 60) return `${s}s`;
   const m = Math.floor(s / 60);
   const rs = s % 60;
   return rs ? `${m}m${rs}s` : `${m}m`;
+}
+
+// Strip scheme + path + port, lower-case, prepend `reflector.` if needed.
+function normalizeReflectorHost(input) {
+  let h = String(input || "").trim().toLowerCase();
+  if (!h) return "";
+  if (h.startsWith("wss://")) h = h.slice(6);
+  if (h.startsWith("ws://"))  h = h.slice(5);
+  if (h.startsWith("https://")) h = h.slice(8);
+  if (h.startsWith("http://"))  h = h.slice(7);
+  const slash = h.indexOf("/");
+  if (slash >= 0) h = h.slice(0, slash);
+  const colon = h.indexOf(":");
+  if (colon >= 0) h = h.slice(0, colon);
+  const comma = h.indexOf(",");
+  if (comma >= 0) h = h.slice(0, comma);
+  if (!h) return "";
+  if (h.startsWith("reflector.")) return h;
+  return `reflector.${h}`;
+}
+
+// Same input as above, but yields the canonical portal.<domain> host used for
+// the talkgroups.json probe and auto-update.
+function portalHostFor(input) {
+  let h = String(input || "").trim().toLowerCase();
+  if (!h) return "";
+  if (h.startsWith("wss://"))   h = h.slice(6);
+  if (h.startsWith("ws://"))    h = h.slice(5);
+  if (h.startsWith("https://")) h = h.slice(8);
+  if (h.startsWith("http://"))  h = h.slice(7);
+  const slash = h.indexOf("/");
+  if (slash >= 0) h = h.slice(0, slash);
+  if (h.startsWith("portal.")) return h;
+  if (h.startsWith("reflector.")) h = h.slice("reflector.".length);
+  return `portal.${h}`;
+}
+
+function portalTalkgroupsUrlFor(domain) {
+  const host = portalHostFor(domain);
+  return host ? `https://${host}/talkgroups.json` : "";
 }
 
 // ── History persistence ───────────────────────────────────────────────────────
@@ -140,39 +209,26 @@ function ingestFeed(json) {
   const fq = (json.fq || "").toString().trim();
 
   if (nextTk && nextTk !== prevTk) {
-    // A new talker started. Close any lingering session first.
     closeCurrentSession(now);
-    state.currentSession = {
-      cs: nextTk,
-      tg,
-      fq,
-      startedAt: now,
-      endedAt: null,
-    };
+    state.currentSession = { cs: nextTk, tg, fq, startedAt: now, endedAt: null };
     state.history.unshift(state.currentSession);
     trimHistory();
     saveHistory();
   } else if (!nextTk && prevTk && state.currentSession) {
-    // Talker finished.
     closeCurrentSession(now);
     saveHistory();
   } else if (nextTk && state.currentSession && state.currentSession.cs === nextTk) {
-    // Continuing — update tg/fq if they changed, but keep startedAt.
     state.currentSession.tg = tg || state.currentSession.tg;
     state.currentSession.fq = fq || state.currentSession.fq;
   }
 
-  // If we're not tracking a live session but ltk is present and not in history,
-  // seed a short historical entry. This covers the initial snapshot on connect.
+  // Seed a historical entry from `ltk` on initial snapshot (no live session yet).
   if (!state.currentSession && nextLtk) {
     const top = state.history[0];
     if (!top || top.cs !== nextLtk) {
       state.history.unshift({
-        cs: nextLtk,
-        tg,
-        fq,
-        startedAt: now,
-        endedAt: now,
+        cs: nextLtk, tg, fq,
+        startedAt: now, endedAt: now,
         historical: true,
       });
       trimHistory();
@@ -180,8 +236,13 @@ function ingestFeed(json) {
     }
   }
 
+  // If the hotspot advertises its reflector domain via `rf` and the user
+  // hasn't pinned one in Settings, auto-adopt + probe.
+  maybeAdoptReflectorFromFeed((json.rf || "").toString().trim());
+
   renderFeed();
   renderTable();
+  renderInfo();
   updateTray();
 }
 
@@ -197,22 +258,37 @@ function trimHistory() {
   if (state.history.length > cap) state.history.length = cap;
 }
 
+// Parse `mt` raw — e.g. "8++, 23+, 50" → ["8","23","50"] (strips priority `+`).
+function parseMonitoredTgs(mt) {
+  if (!mt) return [];
+  return String(mt)
+    .split(",")
+    .map((s) => s.trim().replace(/\++$/, ""))
+    .filter(Boolean);
+}
+
+// Parse `ct` raw — e.g. "67.0:8400,69.3:8" → [{ctcss:"67.0", tg:"8400"}, …]
+function parseCtcssMappings(ct) {
+  if (!ct) return [];
+  const out = [];
+  for (const pair of String(ct).split(",")) {
+    const parts = pair.trim().split(":");
+    if (parts.length !== 2) continue;
+    const c = parts[0].trim();
+    const t = parts[1].trim();
+    if (!c || !t) continue;
+    out.push({ ctcss: c, tg: t });
+  }
+  return out;
+}
+
 // ── Rendering ─────────────────────────────────────────────────────────────────
-// 4G/LTE signal meter — buckets per Analog-HotSPOT-SVXLink/BLE.md (modem RSSI):
-//   ≥-70 excellent (4 bars), -85..-70 good (3), -100..-85 fair (2),
-//   -110..-100 weak (1), <-110 very poor (1, red).
 function updateSignalMeter(sg) {
   const meter = document.getElementById("signal-meter");
   if (!meter) return;
-  if (sg === "" || sg == null) {
-    meter.style.display = "none";
-    return;
-  }
+  if (sg === "" || sg == null) { meter.style.display = "none"; return; }
   const dbm = Number(sg);
-  if (!Number.isFinite(dbm)) {
-    meter.style.display = "none";
-    return;
-  }
+  if (!Number.isFinite(dbm)) { meter.style.display = "none"; return; }
   let level, label;
   if (dbm >= -70)        { level = 4; label = "excellent"; }
   else if (dbm >= -85)   { level = 3; label = "good"; }
@@ -227,16 +303,16 @@ function updateSignalMeter(sg) {
 
 function renderFeed() {
   const f = state.feed || {};
-  hsCsEl.textContent = f.cs || "\u2014";
-  hsFqEl.textContent = f.fq ? `${f.fq} MHz` : "\u2014";
-  hsTgEl.textContent = f.tg || "\u2014";
-  hsIpEl.textContent = f.ip || "\u2014";
+  hsCsEl.textContent = f.cs || "—";
+  hsFqEl.textContent = f.fq ? `${f.fq} MHz` : "—";
+  hsTgEl.textContent = f.tg || "—";
+  hsIpEl.textContent = f.ip || "—";
 
   const tk = (f.tk || "").toString().trim();
   const ltk = (f.ltk || "").toString().trim();
   const talking = !!tk;
 
-  hsTkEl.textContent = tk || (ltk ? `${ltk} (last)` : "\u2014");
+  hsTkEl.textContent = tk || (ltk ? `${ltk} (last)` : "—");
   hsActiveEl.classList.toggle("talking", talking);
 
   flagRxEl.classList.toggle("on", Number(f.rx) === 1);
@@ -246,15 +322,12 @@ function renderFeed() {
 
   updateSignalMeter(f.sg);
 
-  // Highlight the TG button matching the hotspot's current talkgroup
   const active = (f.tg || "").toString().trim();
   document.querySelectorAll("#tg-bar-buttons .tg-btn").forEach((btn) => {
     btn.classList.toggle("active", btn.dataset.tg === active);
   });
 }
 
-// Whenever the TG list changes (config save / startup), push the new list
-// to the tray so the context menu stays in sync.
 function refreshTrayTgs() { updateTray(); }
 
 function renderTgBar() {
@@ -271,10 +344,7 @@ function renderTgBar() {
     })
     .join("");
 
-  // Keep the active highlight in sync after rebuild
   renderFeed();
-
-  // Only show the bar when BLE is connected AND we have TGs
   if (tgBarEl) {
     tgBarEl.style.display = state.bleConnected && tgs.length ? "" : "none";
   }
@@ -297,11 +367,9 @@ function renderTable() {
       const dotCls = active ? "dotOnline" : "dotOffline";
       const dur = active
         ? `<span class="timeNow">Now</span>`
-        : s.historical
-          ? "\u2014"
-          : durationLabel((s.endedAt || now) - s.startedAt);
+        : s.historical ? "—" : durationLabel((s.endedAt || now) - s.startedAt);
       const heard = active ? `<span class="timeNow">Now</span>` : msAgoLabel(now - (s.endedAt || s.startedAt));
-      const tg = s.tg ? escapeHtml(s.tg) : "\u2014";
+      const tg = s.tg ? escapeHtml(s.tg) : "—";
       return `
         <tr class="${active ? "talkingRow" : ""}">
           <td class="narrow center"><span class="${dotCls}"></span></td>
@@ -312,6 +380,81 @@ function renderTable() {
         </tr>`;
     })
     .join("");
+}
+
+// ── Info screen rendering ─────────────────────────────────────────────────────
+function signalLabel(dbm) {
+  if (!Number.isFinite(dbm)) return "—";
+  if (dbm === 0) return "Searching…";
+  let bars;
+  if (dbm >= -70)      bars = "excellent";
+  else if (dbm >= -85) bars = "good";
+  else if (dbm >= -100) bars = "fair";
+  else if (dbm >= -110) bars = "weak";
+  else                  bars = "very poor";
+  return `${dbm} dBm · ${bars}`;
+}
+
+function renderInfo() {
+  const grid = document.getElementById("info-grid");
+  const hint = document.getElementById("info-hint");
+  if (!grid) return;
+  const f = state.feed || {};
+  const tiles = [
+    { icon: "📻", label: "Callsign",    value: f.cs || "—", mono: false, copyable: false },
+    { icon: "📈", label: "Frequency",   value: f.fq ? `${f.fq} MHz` : "—" },
+    { icon: "👥", label: "Talkgroup",   value: f.tg || "—" },
+    { icon: "🌐", label: "IP address",  value: f.ip || "—", mono: true, copyable: !!f.ip },
+    { icon: "🛰️", label: "Reflector",   value: f.rf || "—", mono: true, copyable: !!f.rf },
+  ];
+  if (f.sg != null && f.sg !== "") {
+    tiles.push({ icon: "📶", label: "4G signal", value: signalLabel(Number(f.sg)) });
+  }
+  if (f.ctx) tiles.push({ icon: "🔉", label: "Output CTCSS", value: `${f.ctx} Hz` });
+
+  grid.innerHTML = tiles
+    .map((t) => `
+      <div class="info-tile">
+        <span class="info-tile-icon">${t.icon}</span>
+        <div class="info-tile-body">
+          <span class="info-tile-label">${escapeHtml(t.label)}</span>
+          <span class="info-tile-value${t.mono ? " mono" : ""}">${escapeHtml(t.value)}</span>
+        </div>
+        ${t.copyable ? `<button class="info-copy" data-copy="${escapeHtml(t.value)}" title="Copy">⧉</button>` : ""}
+      </div>`)
+    .join("");
+
+  // Monitored TGs
+  const mts = parseMonitoredTgs(f.mt);
+  const mtCard = document.getElementById("info-monitored");
+  const mtChips = document.getElementById("info-mt-chips");
+  if (mts.length) {
+    mtCard.style.display = "";
+    mtChips.innerHTML = mts.map((tg) => {
+      const label = state.talkgroupInfo[tg] || "";
+      const title = label ? `TG ${tg} · ${label}` : `TG ${tg}`;
+      return `<span class="info-chip" title="${escapeHtml(title)}">${escapeHtml(tg)}</span>`;
+    }).join("");
+  } else {
+    mtCard.style.display = "none";
+  }
+
+  // CTCSS mappings
+  const mappings = parseCtcssMappings(f.ct);
+  const ctCard = document.getElementById("info-ctcss");
+  const ctRows = document.getElementById("info-ctcss-rows");
+  if (mappings.length) {
+    ctCard.style.display = "";
+    ctRows.innerHTML = mappings.map((m) => {
+      const label = state.talkgroupInfo[m.tg];
+      const tgLabel = label ? `TG ${m.tg} · ${label}` : `TG ${m.tg}`;
+      return `<div class="info-ctcss-row"><span class="mono">${escapeHtml(m.ctcss)} Hz</span><span>→</span><span>${escapeHtml(tgLabel)}</span></div>`;
+    }).join("");
+  } else {
+    ctCard.style.display = "none";
+  }
+
+  if (hint) hint.style.display = state.bleConnected ? "none" : "";
 }
 
 function updateTray() {
@@ -394,15 +537,13 @@ function setBleStatus(text, cls) {
   if (disconnectBtn) disconnectBtn.style.display = connected ? "" : "none";
 
   if (!connected) {
-    // Wipe live feed view when disconnected, but keep history
     state.feed = {};
     renderFeed();
+    renderInfo();
     updateSignalMeter("");
   }
-  // Always push the new connection state to the tray
   updateTray();
 
-  // Show/hide the TG quick-dial bar with connection state
   if (tgBarEl) {
     const hasTgs = Object.keys(state.talkgroupInfo || {}).length > 0;
     tgBarEl.style.display = connected && hasTgs ? "" : "none";
@@ -465,7 +606,6 @@ function stopKeepalive() {
   if (ble.keepaliveTimer) { clearInterval(ble.keepaliveTimer); ble.keepaliveTimer = null; }
 }
 
-// Keepalive: every 8s read the status CCCD. Prevents CoreBluetooth idle-parking.
 function startKeepalive() {
   stopKeepalive();
   ble.keepaliveTimer = setInterval(async () => {
@@ -473,7 +613,7 @@ function startKeepalive() {
     const dev = ble.device;
     if (!dev?.gatt?.connected || !ch) return;
     try {
-      const cccd = await ch.getDescriptor("00002902-0000-1000-8000-00805f9b34fb");
+      const cccd = await ch.getDescriptor(BLE_CCCD_UUID);
       await cccd.readValue();
     } catch (_) {}
   }, 8000);
@@ -493,7 +633,7 @@ async function bleTryReconnect() {
   ble.reconnecting = true;
   ble.reconnectAttempt += 1;
   const n = ble.reconnectAttempt;
-  setBleStatus("Reconnecting\u2026", "connecting");
+  setBleStatus("Reconnecting…", "connecting");
   try {
     await bleSetupCharacteristics(ble.device);
     ble.reconnecting = false;
@@ -508,7 +648,6 @@ async function bleTryReconnect() {
   }
 }
 
-// Watchdog: revive the reconnect loop if state gets stuck.
 setInterval(() => {
   if (ble.userDisconnected || !ble.device) return;
   const connected = !!ble.device.gatt?.connected && !!ble.writeChar;
@@ -646,13 +785,599 @@ function initBLE() {
     cmdSelect.selectedIndex = 0;
   });
 
-  // TG bar — click sends 91<tg># via DTMF (same as the original portal app)
   tgBarButtonsEl?.addEventListener("click", (e) => {
     const btn = e.target.closest(".tg-btn[data-tg]");
     if (!btn) return;
     const tg = btn.dataset.tg;
     if (!tg) return;
     bleSendDTMF(`91${tg}#`);
+  });
+}
+
+// ── Reflector WSS feed ────────────────────────────────────────────────────────
+// Ports lib/services/reflector_feed.dart. Connects to wss://reflector.<domain>/,
+// processes snapshot / node_upsert / talk_start / talk_stop frames, exposes
+// nodes + sessions via state.reflector.
+const reflectorFeed = {
+  ws: null,
+  snapshotTimer: null,
+  reconnectTimer: null,
+  gotSnapshot: false,
+  disposed: false,
+};
+
+function setReflectorAvailable(v) {
+  if (state.reflector.available === v) return;
+  state.reflector.available = v;
+  renderReflectorScreen();
+  renderMap();
+}
+
+function reflectorReset() {
+  reflectorFeed.gotSnapshot = false;
+  if (reflectorFeed.reconnectTimer) { clearTimeout(reflectorFeed.reconnectTimer); reflectorFeed.reconnectTimer = null; }
+  if (reflectorFeed.snapshotTimer)  { clearTimeout(reflectorFeed.snapshotTimer);  reflectorFeed.snapshotTimer = null; }
+  if (reflectorFeed.ws) {
+    try { reflectorFeed.ws.close(1000); } catch (_) {}
+    reflectorFeed.ws = null;
+  }
+  state.reflector.nodes.clear();
+  state.reflector.sessions.clear();
+  setReflectorAvailable(false);
+  renderReflectorScreen();
+  renderMap();
+}
+
+function reflectorSetDomain(domain, enabled) {
+  const d = String(domain || "").trim();
+  state.reflector.domain = d;
+  state.reflector.enabled = !!enabled;
+  reflectorReset();
+  if (!d || !enabled) return;
+  reflectorConnect();
+}
+
+function reflectorConnect() {
+  if (reflectorFeed.disposed) return;
+  if (!state.reflector.domain || !state.reflector.enabled) return;
+
+  const host = normalizeReflectorHost(state.reflector.domain);
+  if (!host) { setReflectorAvailable(false); return; }
+
+  let ws;
+  try {
+    ws = new WebSocket(`wss://${host}/`);
+  } catch (_) {
+    reflectorScheduleReconnect();
+    return;
+  }
+  reflectorFeed.ws = ws;
+
+  ws.onmessage = (ev) => {
+    if (typeof ev.data !== "string") return;
+    let obj;
+    try { obj = JSON.parse(ev.data); } catch (_) { return; }
+    if (!obj || typeof obj !== "object") return;
+    const type = String(obj.type || "");
+    if      (type === "snapshot")    reflectorHandleSnapshot(obj);
+    else if (type === "node_upsert") reflectorHandleNodeUpsert(obj.node);
+    else if (type === "talk_start" || type === "talk_stop") reflectorHandleTalkEvent(obj.session);
+  };
+  ws.onerror = () => reflectorScheduleReconnect();
+  ws.onclose = () => reflectorScheduleReconnect();
+
+  if (reflectorFeed.snapshotTimer) clearTimeout(reflectorFeed.snapshotTimer);
+  reflectorFeed.snapshotTimer = setTimeout(() => {
+    if (!reflectorFeed.gotSnapshot) {
+      setReflectorAvailable(false);
+      reflectorScheduleReconnect();
+    }
+  }, REFLECTOR_SNAPSHOT_TO_MS);
+}
+
+function reflectorScheduleReconnect() {
+  if (reflectorFeed.disposed) return;
+  if (!state.reflector.domain || !state.reflector.enabled) return;
+  if (!reflectorFeed.gotSnapshot) setReflectorAvailable(false);
+  if (reflectorFeed.ws) {
+    try { reflectorFeed.ws.close(); } catch (_) {}
+    reflectorFeed.ws = null;
+  }
+  if (reflectorFeed.reconnectTimer) clearTimeout(reflectorFeed.reconnectTimer);
+  reflectorFeed.reconnectTimer = setTimeout(reflectorConnect, REFLECTOR_RECONNECT_MS);
+}
+
+function numOrNull(v) {
+  if (typeof v === "number" && Number.isFinite(v)) return v;
+  if (typeof v === "string" && v.trim() !== "") {
+    const n = Number(v);
+    return Number.isFinite(n) ? n : null;
+  }
+  return null;
+}
+
+function intOrZero(v) {
+  const n = numOrNull(v);
+  return n == null ? 0 : Math.trunc(n);
+}
+
+function parseReflectorNode(d) {
+  if (!d || typeof d !== "object") return null;
+  const cs = String(d.callsign || "").trim();
+  if (!cs) return null;
+  const monitored = [];
+  if (Array.isArray(d.monitoredTGs)) {
+    for (const v of d.monitoredTGs) {
+      const n = numOrNull(v);
+      if (n != null) monitored.push(Math.trunc(n));
+    }
+  }
+  return {
+    callsign: cs.toUpperCase(),
+    online: d.online === true,
+    isTalker: d.isTalker === true,
+    tg: intOrZero(d.tg),
+    monitoredTGs: monitored,
+    location: String(d.location || ""),
+    lat: numOrNull(d.lat),
+    lon: numOrNull(d.lon),
+  };
+}
+
+function parseReflectorSession(d) {
+  if (!d || typeof d !== "object") return null;
+  const cs = String(d.callsign || "").trim();
+  if (!cs) return null;
+  const startMs = intOrZero(d.start_ms);
+  const hasEnd = ("end_ms" in d) && d.end_ms != null;
+  const endMs = hasEnd ? intOrZero(d.end_ms) : null;
+  const active = ("active" in d) ? d.active === true : endMs == null;
+  let loc = "", tg = 0;
+  if (d.node && typeof d.node === "object") {
+    loc = String(d.node.nodeLocation || "");
+    tg = intOrZero(d.node.tg);
+  }
+  return {
+    id: `${cs.toUpperCase()}-${startMs}`,
+    callsign: cs.toUpperCase(),
+    startMs,
+    endMs: active ? null : endMs,
+    location: loc,
+    tg,
+    isActive: active,
+    lastActivityMs: endMs ?? startMs,
+  };
+}
+
+// Pull lat/lon out of session.node.qth (mobile model: lat / long not lon).
+function extractSessionGeo(session) {
+  if (!session || typeof session !== "object") return { lat: null, lon: null };
+  let nodeObj = null, qth = null;
+  if (session.node && typeof session.node === "object") nodeObj = session.node;
+  if (nodeObj && nodeObj.qth && typeof nodeObj.qth === "object") qth = nodeObj.qth;
+  else if (session.qth && typeof session.qth === "object") qth = session.qth;
+  const lat = numOrNull(qth?.lat) ?? numOrNull(nodeObj?.lat) ?? numOrNull(session.lat);
+  const lon = numOrNull(qth?.long) ?? numOrNull(qth?.lon) ?? numOrNull(nodeObj?.lon) ?? numOrNull(session.lon);
+  return { lat, lon };
+}
+
+function mergeReflectorNode(existing, incoming, raw) {
+  if (!existing) return incoming;
+  const has = (k) => Object.prototype.hasOwnProperty.call(raw, k) && raw[k] != null;
+  return {
+    callsign: incoming.callsign,
+    online:   has("online")   ? incoming.online   : existing.online,
+    isTalker: has("isTalker") ? incoming.isTalker : existing.isTalker,
+    tg:       has("tg")       ? incoming.tg       : existing.tg,
+    monitoredTGs: has("monitoredTGs") ? incoming.monitoredTGs : existing.monitoredTGs,
+    location: has("location") ? incoming.location : existing.location,
+    lat: incoming.lat ?? existing.lat,
+    lon: incoming.lon ?? existing.lon,
+  };
+}
+
+function reflectorHandleSnapshot(obj) {
+  reflectorFeed.gotSnapshot = true;
+  if (reflectorFeed.snapshotTimer) { clearTimeout(reflectorFeed.snapshotTimer); reflectorFeed.snapshotTimer = null; }
+  state.reflector.nodes.clear();
+  state.reflector.sessions.clear();
+
+  const nodesArr = obj.nodes;
+  if (Array.isArray(nodesArr)) {
+    for (const n of nodesArr) {
+      const node = parseReflectorNode(n);
+      if (node) state.reflector.nodes.set(node.callsign, node);
+    }
+  }
+  for (const key of ["sessions", "active"]) {
+    const arr = obj[key];
+    if (!Array.isArray(arr)) continue;
+    for (const s of arr) {
+      const session = parseReflectorSession(s);
+      if (session) state.reflector.sessions.set(session.id, session);
+      // Synthesize a node when the session arrived without one (AI callsigns).
+      if (session && !state.reflector.nodes.has(session.callsign)) {
+        const geo = extractSessionGeo(s);
+        if (geo.lat != null && geo.lon != null) {
+          state.reflector.nodes.set(session.callsign, {
+            callsign: session.callsign,
+            online: true,
+            isTalker: session.isActive,
+            tg: session.tg,
+            monitoredTGs: [],
+            location: session.location,
+            lat: geo.lat,
+            lon: geo.lon,
+          });
+        }
+      }
+    }
+  }
+  setReflectorAvailable(true);
+  renderReflectorScreen();
+  renderMap();
+}
+
+function reflectorHandleNodeUpsert(data) {
+  if (!data || typeof data !== "object") return;
+  const node = parseReflectorNode(data);
+  if (!node) return;
+  const existing = state.reflector.nodes.get(node.callsign);
+  state.reflector.nodes.set(node.callsign, mergeReflectorNode(existing, node, data));
+  renderReflectorScreen();
+  renderMap();
+}
+
+function reflectorHandleTalkEvent(data) {
+  if (!data || typeof data !== "object") return;
+  const session = parseReflectorSession(data);
+  if (!session) return;
+  state.reflector.sessions.set(session.id, session);
+  // Cap memory.
+  if (state.reflector.sessions.size > REFLECTOR_SESSION_LIMIT * 3) {
+    const sorted = sortedReflectorSessions();
+    state.reflector.sessions.clear();
+    for (const s of sorted.slice(0, REFLECTOR_SESSION_LIMIT)) {
+      state.reflector.sessions.set(s.id, s);
+    }
+  }
+  renderReflectorScreen();
+}
+
+function sortedReflectorSessions() {
+  const list = Array.from(state.reflector.sessions.values());
+  list.sort((a, b) => {
+    if (a.isActive !== b.isActive) return a.isActive ? -1 : 1;
+    return b.lastActivityMs - a.lastActivityMs;
+  });
+  return list.slice(0, REFLECTOR_SESSION_LIMIT);
+}
+
+function renderReflectorScreen() {
+  if (!reflectorStatusEl || !reflectorTbody) return;
+  const enabled = state.reflector.enabled;
+  const domain = state.reflector.domain;
+  const avail = state.reflector.available;
+
+  if (!domain || !enabled) {
+    reflectorStatusEl.textContent = "Reflector feed disabled. Add a reflector domain in Settings.";
+    reflectorStatusEl.className = "reflector-status";
+    reflectorTbody.innerHTML = "";
+    return;
+  }
+  if (!avail) {
+    reflectorStatusEl.textContent = `Connecting to reflector.${normalizeReflectorHost(domain).replace(/^reflector\./, "")}…`;
+    reflectorStatusEl.className = "reflector-status connecting";
+  } else {
+    reflectorStatusEl.textContent = `Live — ${state.reflector.nodes.size} nodes`;
+    reflectorStatusEl.className = "reflector-status connected";
+  }
+
+  const sessions = sortedReflectorSessions();
+  if (sessions.length === 0) {
+    reflectorTbody.innerHTML = `<tr class="emptyRow"><td colspan="6">No talkers on the reflector right now.</td></tr>`;
+    return;
+  }
+  const now = Date.now();
+  reflectorTbody.innerHTML = sessions.map((s) => {
+    const active = s.isActive;
+    const dotCls = active ? "dotOnline" : "dotOffline";
+    const dur = active ? `<span class="timeNow">Now</span>`
+                       : durationLabel((s.endMs ?? now) - s.startMs);
+    const heard = active ? `<span class="timeNow">Now</span>`
+                         : msAgoLabel(now - (s.endMs ?? s.startMs));
+    const tgLabel = s.tg ? `TG ${s.tg}` : "—";
+    return `
+      <tr class="${active ? "talkingRow" : ""}">
+        <td class="narrow center"><span class="${dotCls}"></span></td>
+        <td><strong>${escapeHtml(s.callsign)}</strong></td>
+        <td>${escapeHtml(tgLabel)}</td>
+        <td>${escapeHtml(s.location || "—")}</td>
+        <td class="center">${dur}</td>
+        <td class="center">${heard}</td>
+      </tr>`;
+  }).join("");
+}
+
+// ── Talkgroups portal probe / auto-update ─────────────────────────────────────
+let tgUpdateTimer = null;
+
+async function fetchTalkgroupsFromUrl(url) {
+  if (!url) return null;
+  try {
+    const res = await fetch(url, {
+      headers: { Accept: "application/json" },
+      cache: "no-store",
+    });
+    if (!res.ok) return null;
+    const json = await res.json();
+    if (!json || typeof json !== "object") return null;
+    const out = {};
+    for (const [k, v] of Object.entries(json)) {
+      const key = String(k).trim();
+      if (key) out[key] = String(v ?? "");
+    }
+    return Object.keys(out).length ? out : null;
+  } catch (_) {
+    return null;
+  }
+}
+
+async function probeReflectorWss(domain) {
+  // We can't do a raw HTTP Upgrade probe from a renderer without CORS issues,
+  // so we attempt an actual WebSocket open with a short timeout instead.
+  const host = normalizeReflectorHost(domain);
+  if (!host) return false;
+  return await new Promise((resolve) => {
+    let done = false;
+    let ws;
+    const finish = (ok) => { if (done) return; done = true; try { ws && ws.close(); } catch (_) {} resolve(ok); };
+    try { ws = new WebSocket(`wss://${host}/`); } catch (_) { return resolve(false); }
+    ws.onopen  = () => finish(true);
+    ws.onerror = () => finish(false);
+    ws.onclose = () => finish(false);
+    setTimeout(() => finish(false), 4000);
+  });
+}
+
+async function reflectorProbe() {
+  if (!reflectorProbeResult) return;
+  const domain = (inputReflectorDomain?.value || "").trim();
+  if (!domain) { reflectorProbeResult.textContent = "Enter a domain first."; reflectorProbeResult.className = "settings-hint bad"; return; }
+  reflectorProbeResult.textContent = "Probing…";
+  reflectorProbeResult.className = "settings-hint";
+  const wssOk = await probeReflectorWss(domain);
+  const tgUrl = portalTalkgroupsUrlFor(domain);
+  const tg = await fetchTalkgroupsFromUrl(tgUrl);
+  const parts = [];
+  parts.push(wssOk ? "✓ WSS" : "✗ WSS");
+  parts.push(tg ? `✓ talkgroups (${Object.keys(tg).length})` : "✗ talkgroups");
+  reflectorProbeResult.textContent = parts.join("  ");
+  reflectorProbeResult.className = "settings-hint " + (wssOk && tg ? "ok" : "bad");
+}
+
+// Schedule talkgroup auto-refresh — fires immediately, then every 8 h.
+function rescheduleTgAutoUpdate() {
+  if (tgUpdateTimer) { clearInterval(tgUpdateTimer); tgUpdateTimer = null; }
+  const cfg = state.cfg || {};
+  if (!cfg.tgAutoUpdate) return;
+  const url = (cfg.tgUpdateUrl || "").trim() || portalTalkgroupsUrlFor(cfg.reflectorDomain || "");
+  if (!url) return;
+  const tick = async () => {
+    const fetched = await fetchTalkgroupsFromUrl(url);
+    if (fetched && Object.keys(fetched).length) {
+      state.talkgroupInfo = fetched;
+      state.cfg = { ...state.cfg, talkgroupInfo: fetched };
+      window.api.saveSettings({ talkgroupInfo: fetched }).catch(() => {});
+      renderTgBar();
+      renderInfo();
+      refreshTrayTgs();
+    }
+  };
+  tick();
+  tgUpdateTimer = setInterval(tick, TG_REFRESH_INTERVAL_MS);
+}
+
+// When the hotspot exposes its reflector domain via `rf` and the user hasn't
+// configured one yet, adopt it silently and start probing.
+function maybeAdoptReflectorFromFeed(rfDomain) {
+  if (!rfDomain) return;
+  const cfg = state.cfg || {};
+  if (cfg.reflectorDomain) return;
+  state.cfg = { ...state.cfg, reflectorDomain: rfDomain };
+  window.api.saveSettings({ reflectorDomain: rfDomain }).catch(() => {});
+  reflectorSetDomain(rfDomain, cfg.wssEnabled !== false);
+  if (state.cfg.tgAutoUpdate) rescheduleTgAutoUpdate();
+}
+
+// ── Screen navigation ─────────────────────────────────────────────────────────
+function showScreen(name) {
+  if (!["home", "map", "info", "reflector"].includes(name)) name = "home";
+  state.activeScreen = name;
+  try { localStorage.setItem(SCREEN_KEY, name); } catch {}
+  document.querySelectorAll(".screen").forEach((el) => {
+    el.dataset.active = el.id === `screen-${name}` ? "true" : "false";
+  });
+  document.querySelectorAll("#tabbar .tab").forEach((el) => {
+    const active = el.dataset.screen === name;
+    el.classList.toggle("active", active);
+    el.setAttribute("aria-selected", active ? "true" : "false");
+  });
+  if (name === "map") ensureMap();
+  if (name === "info") renderInfo();
+  if (name === "reflector") renderReflectorScreen();
+}
+
+function initTabBar() {
+  document.querySelectorAll("#tabbar .tab").forEach((tab) => {
+    tab.addEventListener("click", () => showScreen(tab.dataset.screen));
+  });
+  let saved = "home";
+  try { saved = localStorage.getItem(SCREEN_KEY) || "home"; } catch {}
+  showScreen(saved);
+}
+
+// ── Map (Leaflet) ─────────────────────────────────────────────────────────────
+const mapState = {
+  map: null,
+  markersLayer: null,
+  homeMarker: null,
+  initialized: false,
+};
+
+const NODE_COLOR_TALKER  = "#D92929";
+const NODE_COLOR_SUFFIX  = "#2D9CDB";
+const NODE_COLOR_OFFLINE = "#8C8C8C";
+const NODE_COLOR_REPEATER = "#36C58D";
+const NODE_COLOR_NODE    = "#FFA600";
+
+function nodeColor(n) {
+  if (n.isTalker) return NODE_COLOR_TALKER;
+  if (!n.online) return NODE_COLOR_OFFLINE;
+  if (n.callsign.includes("/")) return NODE_COLOR_SUFFIX;
+  if (n.callsign.startsWith("ON0")) return NODE_COLOR_REPEATER;
+  return NODE_COLOR_NODE;
+}
+
+function ensureMap() {
+  if (mapState.initialized) { setTimeout(() => mapState.map.invalidateSize(), 50); return; }
+  if (typeof L === "undefined") return;
+  const host = document.getElementById("map-host");
+  if (!host) return;
+  mapState.map = L.map(host, {
+    zoomControl: true,
+    attributionControl: true,
+    worldCopyJump: true,
+  }).setView([50.85, 4.35], 6); // Brussels-ish default
+  L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+    maxZoom: 19,
+    attribution: "© OpenStreetMap contributors",
+  }).addTo(mapState.map);
+  mapState.markersLayer = L.layerGroup().addTo(mapState.map);
+  mapState.initialized = true;
+
+  // Click to set home QTH
+  mapState.map.on("click", (e) => {
+    setHomeLatLng(e.latlng.lat, e.latlng.lng, /*persist*/ true);
+  });
+
+  fitMapInitial();
+  renderMap();
+}
+
+function setHomeLatLng(lat, lng, persist) {
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) return;
+  state.cfg = { ...state.cfg, homeLat: lat, homeLng: lng };
+  if (persist) window.api.saveSettings({ homeLat: lat, homeLng: lng }).catch(() => {});
+  if (inputHomeLat) inputHomeLat.value = lat.toFixed(5);
+  if (inputHomeLng) inputHomeLng.value = lng.toFixed(5);
+  updateHomeMarker();
+  document.getElementById("btn-map-center")?.removeAttribute("disabled");
+}
+
+function updateHomeMarker() {
+  if (!mapState.map) return;
+  const lat = Number(state.cfg?.homeLat);
+  const lng = Number(state.cfg?.homeLng);
+  if (!Number.isFinite(lat) || !Number.isFinite(lng)) {
+    if (mapState.homeMarker) { mapState.map.removeLayer(mapState.homeMarker); mapState.homeMarker = null; }
+    return;
+  }
+  if (mapState.homeMarker) {
+    mapState.homeMarker.setLatLng([lat, lng]);
+  } else {
+    const icon = L.divIcon({
+      className: "home-marker",
+      html: `<div class="home-dot"></div>`,
+      iconSize: [18, 18],
+      iconAnchor: [9, 9],
+    });
+    mapState.homeMarker = L.marker([lat, lng], { icon, title: "Home QTH", zIndexOffset: 1000 }).addTo(mapState.map);
+  }
+}
+
+function fitMapInitial() {
+  if (!mapState.map) return;
+  const lat = Number(state.cfg?.homeLat);
+  const lng = Number(state.cfg?.homeLng);
+  if (Number.isFinite(lat) && Number.isFinite(lng)) {
+    fitToHome(lat, lng, Number(state.cfg?.homeRadiusKm) || DEFAULT_HOME_RADIUS_KM);
+    updateHomeMarker();
+    document.getElementById("btn-map-center")?.removeAttribute("disabled");
+    return;
+  }
+  // Else: try fit-to-nodes once nodes arrive.
+  const geoNodes = Array.from(state.reflector.nodes.values()).filter((n) => n.lat != null && n.lon != null);
+  if (geoNodes.length) {
+    const bounds = L.latLngBounds(geoNodes.map((n) => [n.lat, n.lon]));
+    mapState.map.fitBounds(bounds, { padding: [40, 40] });
+  }
+}
+
+function fitToHome(lat, lng, radiusKm) {
+  if (!mapState.map) return;
+  const dLat = radiusKm / 111.32;
+  const cosLat = Math.cos((lat * Math.PI) / 180);
+  const dLng = radiusKm / (111.32 * Math.max(Math.abs(cosLat), 1e-6));
+  const bounds = L.latLngBounds([lat - dLat, lng - dLng], [lat + dLat, lng + dLng]);
+  mapState.map.fitBounds(bounds, { padding: [40, 40] });
+}
+
+function renderMap() {
+  if (!mapState.map || !mapState.markersLayer) return;
+  mapState.markersLayer.clearLayers();
+  const nodes = Array.from(state.reflector.nodes.values()).filter((n) => n.lat != null && n.lon != null);
+  for (const n of nodes) {
+    const isTalker = !!n.isTalker;
+    const color = nodeColor(n);
+    const size = isTalker ? 16 : 10;
+    const marker = L.circleMarker([n.lat, n.lon], {
+      radius: size / 2,
+      color,
+      fillColor: color,
+      fillOpacity: isTalker ? 0.95 : 0.85,
+      weight: isTalker ? 2 : 1,
+    });
+    const monitored = n.monitoredTGs?.length ? `Monitors: ${n.monitoredTGs.join(", ")}` : "";
+    const html = `
+      <div class="map-popup">
+        <div class="map-popup-cs">${escapeHtml(n.callsign)}</div>
+        <div class="map-popup-loc">${escapeHtml(n.location || "")}</div>
+        ${n.tg ? `<div class="map-popup-tg">TG ${n.tg}</div>` : ""}
+        ${monitored ? `<div class="map-popup-mt">${escapeHtml(monitored)}</div>` : ""}
+        <div class="map-popup-state">${isTalker ? "Talking" : (n.online ? "Online" : "Offline")}</div>
+      </div>`;
+    marker.bindPopup(html);
+    marker.addTo(mapState.markersLayer);
+  }
+  updateHomeMarker();
+}
+
+function initMapButtons() {
+  document.getElementById("btn-map-home")?.addEventListener("click", async () => {
+    if (!navigator.geolocation) {
+      const hint = document.getElementById("map-hint");
+      if (hint) hint.textContent = "Geolocation unavailable — click the map instead.";
+      return;
+    }
+    navigator.geolocation.getCurrentPosition(
+      (pos) => {
+        setHomeLatLng(pos.coords.latitude, pos.coords.longitude, true);
+        fitToHome(pos.coords.latitude, pos.coords.longitude, Number(state.cfg?.homeRadiusKm) || DEFAULT_HOME_RADIUS_KM);
+      },
+      (err) => {
+        const hint = document.getElementById("map-hint");
+        if (hint) hint.textContent = `No GPS fix (${err.message || "denied"}). Click the map to set home.`;
+      },
+      { enableHighAccuracy: false, timeout: 8000, maximumAge: 60000 }
+    );
+  });
+  document.getElementById("btn-map-center")?.addEventListener("click", () => {
+    const lat = Number(state.cfg?.homeLat);
+    const lng = Number(state.cfg?.homeLng);
+    if (Number.isFinite(lat) && Number.isFinite(lng)) {
+      fitToHome(lat, lng, Number(state.cfg?.homeRadiusKm) || DEFAULT_HOME_RADIUS_KM);
+    }
   });
 }
 
@@ -682,6 +1407,13 @@ function openSettings() {
     const tg = state.talkgroupInfo;
     inputTgInfo.value = tg && Object.keys(tg).length ? JSON.stringify(tg, null, 2) : "";
   }
+  if (inputReflectorDomain) inputReflectorDomain.value = cfg.reflectorDomain || "";
+  if (wssToggleEl) wssToggleEl.checked = cfg.wssEnabled !== false;
+  if (tgAutoUpdateToggleEl) tgAutoUpdateToggleEl.checked = !!cfg.tgAutoUpdate;
+  if (inputHomeLat) inputHomeLat.value = cfg.homeLat != null ? String(cfg.homeLat) : "";
+  if (inputHomeLng) inputHomeLng.value = cfg.homeLng != null ? String(cfg.homeLng) : "";
+  if (inputHomeRadius) inputHomeRadius.value = cfg.homeRadiusKm != null ? String(cfg.homeRadiusKm) : String(DEFAULT_HOME_RADIUS_KM);
+  if (reflectorProbeResult) { reflectorProbeResult.textContent = ""; reflectorProbeResult.className = "settings-hint"; }
   settingsPanelEl.classList.remove("hidden");
 }
 
@@ -705,6 +1437,12 @@ function applyConfig(cfg) {
   state.talkgroupInfo = normalizeTgInfo(cfg.talkgroupInfo || {});
   renderTgBar();
   refreshTrayTgs();
+  renderInfo();
+  renderMap();
+
+  // Reflector / WSS
+  reflectorSetDomain(cfg.reflectorDomain || "", cfg.wssEnabled !== false);
+  rescheduleTgAutoUpdate();
 }
 
 function initSettings() {
@@ -725,6 +1463,12 @@ function initSettings() {
       const tg = defaults.talkgroupInfo;
       inputTgInfo.value = tg && Object.keys(tg).length ? JSON.stringify(tg, null, 2) : "";
     }
+    if (inputReflectorDomain) inputReflectorDomain.value = defaults.reflectorDomain || "";
+    if (wssToggleEl) wssToggleEl.checked = defaults.wssEnabled !== false;
+    if (tgAutoUpdateToggleEl) tgAutoUpdateToggleEl.checked = !!defaults.tgAutoUpdate;
+    if (inputHomeLat) inputHomeLat.value = "";
+    if (inputHomeLng) inputHomeLng.value = "";
+    if (inputHomeRadius) inputHomeRadius.value = String(defaults.homeRadiusKm || DEFAULT_HOME_RADIUS_KM);
   });
 
   document.getElementById("btn-clear-history")?.addEventListener("click", () => {
@@ -734,6 +1478,13 @@ function initSettings() {
     saveHistory();
     renderTable();
   });
+
+  document.getElementById("btn-clear-home")?.addEventListener("click", () => {
+    if (inputHomeLat) inputHomeLat.value = "";
+    if (inputHomeLng) inputHomeLng.value = "";
+  });
+
+  document.getElementById("btn-reflector-probe")?.addEventListener("click", reflectorProbe);
 
   document.getElementById("btn-save-settings")?.addEventListener("click", async () => {
     const title = (inputAppTitle?.value || "").trim() || "HotSpot";
@@ -748,28 +1499,54 @@ function initSettings() {
       return;
     }
 
+    const reflectorDomain = (inputReflectorDomain?.value || "").trim();
+    const wssEnabled = !!(wssToggleEl?.checked);
+    const tgAutoUpdate = !!(tgAutoUpdateToggleEl?.checked);
+    const tgUpdateUrl = reflectorDomain ? portalTalkgroupsUrlFor(reflectorDomain) : "";
+
+    const latStr = (inputHomeLat?.value || "").trim();
+    const lngStr = (inputHomeLng?.value || "").trim();
+    const homeLat = latStr ? Number(latStr) : null;
+    const homeLng = lngStr ? Number(lngStr) : null;
+    const homeRadiusKm = Number(inputHomeRadius?.value) || DEFAULT_HOME_RADIUS_KM;
+
     state.historyLimit = limit;
     saveHistoryLimit(limit);
 
-    const newCfg = { title, talkgroupInfo };
+    const newCfg = {
+      title, talkgroupInfo,
+      reflectorDomain, wssEnabled, tgAutoUpdate, tgUpdateUrl,
+      homeLat: Number.isFinite(homeLat) ? homeLat : null,
+      homeLng: Number.isFinite(homeLng) ? homeLng : null,
+      homeRadiusKm,
+    };
     await window.api.saveSettings(newCfg);
-    applyConfig(newCfg);
+    applyConfig({ ...state.cfg, ...newCfg });
 
     closeSettings();
     renderTable();
   });
 
   themeToggleEl?.addEventListener("change", () => applyTheme(themeToggleEl.checked));
+
+  // Info copy buttons (delegated)
+  document.getElementById("info-grid")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".info-copy[data-copy]");
+    if (!btn) return;
+    const val = btn.getAttribute("data-copy");
+    if (val) navigator.clipboard?.writeText(val).catch(() => {});
+  });
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
 async function main() {
   initTheme();
   initTitleBar();
+  initTabBar();
   initSettings();
   initBLE();
+  initMapButtons();
 
-  // Tray-menu TG clicks — main process asks us to send a DTMF string.
   try {
     window.api.onSendDtmfRequest?.((dtmf) => bleSendDTMF(dtmf));
   } catch {}
@@ -786,9 +1563,13 @@ async function main() {
 
   renderFeed();
   renderTable();
+  renderInfo();
+  renderReflectorScreen();
 
-  // Tick the "ago" labels once a second
-  setInterval(() => renderTable(), 1000);
+  setInterval(() => {
+    renderTable();
+    if (state.activeScreen === "reflector") renderReflectorScreen();
+  }, 1000);
 }
 
 main().catch((err) => {

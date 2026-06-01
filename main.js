@@ -33,6 +33,16 @@ const DEFAULT_SETTINGS = {
     "8401": "145.7125 VHF Repeater Oostende",
     "9000": "145.7 VHF Repeater Gent",
   },
+  // Reflector / WSS — feature unlocks when the user sets a domain.
+  reflectorDomain: "",
+  wssEnabled: true,
+  // Talkgroups auto-update via portal.<domain>/talkgroups.json
+  tgAutoUpdate: false,
+  tgUpdateUrl: "",
+  // Map / home QTH
+  homeLat: null,
+  homeLng: null,
+  homeRadiusKm: 150,
 };
 
 function loadSettings() {
@@ -59,8 +69,10 @@ function createWindow() {
   mainWindow = new BrowserWindow({
     width: 900,
     height: 720,
-    resizable: false,
-    maximizable: false,
+    minWidth: 900,
+    minHeight: 720,
+    resizable: true,
+    maximizable: true,
     fullscreenable: false,
     alwaysOnTop: settings.alwaysOnTop || false,
     frame: false,
@@ -128,7 +140,15 @@ function createWindow() {
     return details.deviceType === "bluetooth";
   });
   mainWindow.webContents.session.setPermissionCheckHandler((_wc, permission) => {
-    return permission === "bluetooth" || permission === "bluetooth-devices";
+    return ["bluetooth", "bluetooth-devices", "geolocation", "clipboard-sanitized-write"].includes(permission);
+  });
+  // Auto-grant geolocation requests (the Map screen uses navigator.geolocation
+  // to seed Home QTH). Electron's default handler denies without prompting.
+  mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+    if (permission === "geolocation" || permission === "clipboard-sanitized-write") {
+      return callback(true);
+    }
+    callback(false);
   });
 
 }
