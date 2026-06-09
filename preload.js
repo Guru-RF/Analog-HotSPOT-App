@@ -5,7 +5,14 @@ contextBridge.exposeInMainWorld("api", {
   saveSettings: (s) => ipcRenderer.invoke("settings:save", s),
   getDefaults: () => ipcRenderer.invoke("settings:defaults"),
   updateTrayState: (state) => ipcRenderer.send("tray:state", state),
-  setPreferredBleName: (name) => ipcRenderer.send("ble:preferred-name", name),
+  setPreferredBleId: (id) => ipcRenderer.send("ble:preferred-id", id),
+
+  // BLE picker — multi-hotspot flow (mirrors mobile)
+  onBleCandidates: (cb) =>
+    ipcRenderer.on("ble:candidates", (_e, payload) => cb(payload)),
+  bleChoose: (deviceId) => ipcRenderer.send("ble:choose", deviceId),
+  bleCancelScan: () => ipcRenderer.send("ble:cancel-scan"),
+  bleForget: () => ipcRenderer.send("ble:forget"),
 
   minimize: () => ipcRenderer.send("window:minimize"),
   close: () => ipcRenderer.send("window:close"),

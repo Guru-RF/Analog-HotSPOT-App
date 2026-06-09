@@ -28,6 +28,29 @@
       </div>
     </div>
 
+    <!-- BLE picker overlay (multi-hotspot) — hidden until main process pushes
+         candidates after the 3-s resolution window. Mirrors the mobile app's
+         hotspot_picker_sheet.dart. -->
+    <div id="ble-picker-overlay" class="hidden" role="dialog" aria-modal="true">
+      <div id="ble-picker">
+        <div id="ble-picker-header">
+          <div class="ble-picker-titles">
+            <span class="ble-picker-title">Nearby HotSpots</span>
+            <span class="ble-picker-sub" id="ble-picker-sub">Scanning…</span>
+          </div>
+          <button class="tb-btn" id="btn-ble-forget" title="Forget the saved HotSpot">Forget</button>
+        </div>
+        <div id="ble-picker-list">
+          <!-- candidate tiles injected here by renderer -->
+        </div>
+        <div id="ble-picker-actions">
+          <button class="btn-ghost" id="btn-ble-picker-cancel">Cancel</button>
+          <span style="flex:1"></span>
+          <button class="btn-ghost" id="btn-ble-rescan" style="display:none">Rescan</button>
+        </div>
+      </div>
+    </div>
+
     <!-- Tab bar -->
     <nav id="tabbar" role="tablist">
       <button class="tab active" data-screen="home" role="tab" aria-selected="true">Home</button>

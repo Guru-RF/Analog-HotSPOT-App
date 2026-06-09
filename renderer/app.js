@@ -20,7 +20,11 @@ const BLE_FEED_UUID   = "6b1d6a14-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_CCCD_UUID   = "00002902-0000-1000-8000-00805f9b34fb";
 
 const HISTORY_KEY        = "ahs-app-talker-history-v1";
+// Legacy: advertised name of the last hotspot. Kept only for the friendly
+// "(last: <name>)" status string — auto-connect now keys on deviceId.
 const BLE_LAST_DEVICE    = "ahs-app-ble-last-device";
+// Platform-stable BLE identifier. Survives hotspot rename/reflash.
+const BLE_LAST_DEVICE_ID = "ahs-app-ble-last-device-id";
 const SCREEN_KEY         = "ahs-app-screen";
 
 // Reflector / portal constants — match Flutter mobile app constants.dart.
@@ -450,17 +454,39 @@ const ble = {
   reconnectAttempt: 0,
   reconnecting: false,
   keepaliveTimer: null,
+  // True between the moment bleConnect() entered and the requestDevice()
+  // promise settled (success or rejection). Prevents a second
+  // requestDevice() from going out concurrently — Chromium delivers each
+  // chooser callback bound to ONE pending request, so two pending requests
+  // means the first callback gets orphaned and its promise hangs forever.
+  scanning: false,
 };
 
 function getSavedDeviceName() {
   try { return localStorage.getItem(BLE_LAST_DEVICE) || ""; }
   catch { return ""; }
 }
+function getSavedDeviceId() {
+  try { return localStorage.getItem(BLE_LAST_DEVICE_ID) || ""; }
+  catch { return ""; }
+}
 
-function saveDeviceName(name) {
-  if (!name) return;
-  try { localStorage.setItem(BLE_LAST_DEVICE, name); } catch {}
-  try { window.api.setPreferredBleName?.(name); } catch {}
+// Called on every successful connect — id is what the picker keys on, name
+// is purely cosmetic (status line, picker tile).
+function saveDeviceIdentity(id, name) {
+  if (id) {
+    try { localStorage.setItem(BLE_LAST_DEVICE_ID, id); } catch {}
+    try { window.api.setPreferredBleId?.(id); } catch {}
+  }
+  if (name) {
+    try { localStorage.setItem(BLE_LAST_DEVICE, name); } catch {}
+  }
+}
+
+function forgetSavedDevice() {
+  try { localStorage.removeItem(BLE_LAST_DEVICE); } catch {}
+  try { localStorage.removeItem(BLE_LAST_DEVICE_ID); } catch {}
+  try { window.api.bleForget?.(); } catch {}
 }
 
 function setBleStatus(text, cls) {
@@ -482,6 +508,12 @@ function setBleStatus(text, cls) {
 
   const connected = cls === "connected";
   state.bleConnected = connected;
+
+  // Only close the picker on a successful connect. Error / disconnect
+  // states keep the picker open so the user can pick a different candidate
+  // without re-triggering the whole scan loop (mirrors the mobile sheet
+  // which only auto-closes on BleConnState.connected).
+  if (connected) hideBlePicker();
 
   // Always offer a way to scan when we're not connected — saved or not. On a
   // fresh install with no saved name we'd otherwise have no manual entry point
@@ -603,7 +635,7 @@ async function bleTryReconnect() {
     await bleSetupCharacteristics(ble.device);
     ble.reconnecting = false;
     ble.reconnectAttempt = 0;
-    if (ble.device.name) saveDeviceName(ble.device.name);
+    saveDeviceIdentity(ble.device.id, ble.device.name);
     setBleStatus(ble.device.name || "Connected", "connected");
     startKeepalive();
   } catch (_) {
@@ -625,6 +657,19 @@ async function bleConnect() {
     setBleStatus("Web Bluetooth not available", "error");
     return;
   }
+  // Re-entrancy guard — a second click while the first requestDevice() is
+  // still pending would clobber characteristics mid-scan AND produce two
+  // concurrent Web Bluetooth requests, orphaning the first.
+  if (ble.scanning) return;
+  ble.scanning = true;
+
+  // Reset picker state at scan entry so the empty-state copy starts at
+  // "Looking…" again and any prior candidate list doesn't flash above the
+  // "Scanning…" status. Render is a no-op when the picker isn't visible.
+  picker.candidates = [];
+  picker.scanEnded = false;
+  picker.selectedId = null;
+  renderBlePicker();
 
   bleClearReconnect();
   if (ble.device) {
@@ -654,19 +699,32 @@ async function bleConnect() {
     });
 
     await bleSetupCharacteristics(device);
-    if (device.name) saveDeviceName(device.name);
+    ble.scanning = false;
+    saveDeviceIdentity(device.id, device.name);
     setBleStatus(device.name || "Connected", "connected");
     startKeepalive();
   } catch (err) {
+    ble.scanning = false;
     console.error("BLE connect failed:", err);
     const msg = err.message || "Connect failed";
     const cancelled = /cancel/i.test(msg) || err.name === "NotFoundError";
+    // Picker stays visible so the user can retry without re-triggering the
+    // whole scan loop. Clear the spinner so other tiles re-enable, and on a
+    // 30 s NotFoundError flip to the "scan ended" empty state with Rescan.
+    picker.selectedId = null;
+    if (picker.visible) {
+      if (cancelled && picker.candidates.length === 0) picker.scanEnded = true;
+      renderBlePicker();
+    }
     setBleStatus(cancelled ? "Not connected" : msg, cancelled ? "" : "error");
   }
 }
 
 async function bleAutoReconnectOnStartup() {
-  if (!getSavedDeviceName()) return;
+  // Either persistence key is enough — id is preferred but a v1.0.7-era
+  // install that only has the name still gets an auto-scan, just with the
+  // picker popping up at the end of the resolution window.
+  if (!getSavedDeviceId() && !getSavedDeviceName()) return;
   await bleConnect();
 }
 window.bleAutoReconnectOnStartup = bleAutoReconnectOnStartup;
@@ -716,10 +774,149 @@ async function bleSendCommand(cmd) {
   }
 }
 
+// ── BLE multi-hotspot picker (mirrors mobile hotspot_picker_sheet.dart) ──
+// Main process pushes `ble:candidates` once the resolution window is up and
+// auto-connect didn't apply. Renderer keeps the overlay in sync with the
+// streamed list and forwards the user's choice / cancel back via IPC.
+const picker = {
+  visible: false,
+  selectedId: null,   // device the user just tapped (shows spinner)
+  candidates: [],
+  preferredId: "",
+  scanEnded: false,   // 30 s timeout fired with zero results → show Rescan
+};
+
+function renderBlePicker() {
+  const overlay = document.getElementById("ble-picker-overlay");
+  const list = document.getElementById("ble-picker-list");
+  const sub = document.getElementById("ble-picker-sub");
+  const forget = document.getElementById("btn-ble-forget");
+  const rescan = document.getElementById("btn-ble-rescan");
+  if (!overlay || !list) return;
+  overlay.classList.toggle("hidden", !picker.visible);
+  if (!picker.visible) return;
+
+  // Forget hides mid-connect — otherwise the in-flight GATT setup would
+  // run saveDeviceIdentity() afterwards and silently re-save the id the
+  // user just removed.
+  if (forget) {
+    const canForget = picker.preferredId && !picker.selectedId;
+    forget.style.display = canForget ? "" : "none";
+  }
+  if (rescan) rescan.style.display = picker.scanEnded ? "" : "none";
+  if (sub) {
+    if (picker.candidates.length) sub.textContent = "Tap to connect";
+    else if (picker.scanEnded)    sub.textContent = "Scan ended";
+    else                          sub.textContent = "Scanning…";
+  }
+
+  if (picker.candidates.length === 0) {
+    if (picker.scanEnded) {
+      list.innerHTML = `
+        <div class="ble-picker-empty">
+          <div class="ble-picker-empty-icon">📡</div>
+          <div class="ble-picker-empty-title">No HotSpots found in range.</div>
+          <div class="ble-picker-empty-sub">Make sure your HotSpot is powered on, then click <strong>Rescan</strong>.</div>
+        </div>`;
+    } else {
+      list.innerHTML = `
+        <div class="ble-picker-empty">
+          <div class="ble-picker-empty-icon">🔍</div>
+          <div class="ble-picker-empty-title">Looking for HotSpots in range…</div>
+          <div class="ble-picker-empty-sub">Make sure your HotSpot is powered on and not already connected to another device.</div>
+        </div>`;
+    }
+    return;
+  }
+
+  // Float saved-id match to the top regardless of advertised name.
+  const sorted = picker.candidates.slice().sort((a, b) => {
+    const aPref = a.deviceId === picker.preferredId ? 0 : 1;
+    const bPref = b.deviceId === picker.preferredId ? 0 : 1;
+    if (aPref !== bPref) return aPref - bPref;
+    return (a.deviceName || "").localeCompare(b.deviceName || "");
+  });
+
+  list.innerHTML = sorted.map((d) => {
+    const name = d.deviceName || "(no name)";
+    const isSaved = d.deviceId === picker.preferredId;
+    const connecting = picker.selectedId === d.deviceId;
+    const dimmed = picker.selectedId != null && picker.selectedId !== d.deviceId;
+    return `
+      <button class="ble-picker-tile${connecting ? " connecting" : ""}${dimmed ? " dimmed" : ""}"
+              data-id="${escapeHtml(d.deviceId)}"
+              ${dimmed ? "disabled" : ""}>
+        <span class="ble-picker-tile-icon">${connecting ? "⟳" : "📡"}</span>
+        <span class="ble-picker-tile-body">
+          <span class="ble-picker-tile-name">
+            ${escapeHtml(name)}
+            ${isSaved ? `<span class="ble-picker-chip">Last used</span>` : ""}
+          </span>
+          <span class="ble-picker-tile-id">${escapeHtml(d.deviceId)}</span>
+        </span>
+      </button>`;
+  }).join("");
+}
+
+function showBlePicker(payload) {
+  // Ignore late candidate-list pushes that arrive AFTER the user already
+  // tapped a tile — a stale ble:candidates IPC queued before ble:choose
+  // would otherwise reset selectedId, un-spin the chosen tile, and
+  // re-enable the others (race the audit flagged as the "two ble:choose
+  // IPCs in flight" path).
+  if (picker.selectedId) {
+    picker.candidates = Array.isArray(payload?.devices) ? payload.devices : picker.candidates;
+    picker.preferredId = String(payload?.preferredId || "");
+    return;
+  }
+  picker.candidates = Array.isArray(payload?.devices) ? payload.devices : [];
+  picker.preferredId = String(payload?.preferredId || "");
+  picker.visible = true;
+  picker.scanEnded = false;
+  renderBlePicker();
+}
+
+function hideBlePicker() {
+  picker.visible = false;
+  picker.selectedId = null;
+  picker.candidates = [];
+  picker.scanEnded = false;
+  renderBlePicker();
+}
+
+function initBlePickerUI() {
+  document.getElementById("ble-picker-list")?.addEventListener("click", (e) => {
+    const btn = e.target.closest(".ble-picker-tile[data-id]");
+    if (!btn || picker.selectedId) return;
+    const id = btn.dataset.id;
+    picker.selectedId = id;
+    renderBlePicker();
+    try { window.api.bleChoose?.(id); } catch {}
+  });
+  document.getElementById("btn-ble-picker-cancel")?.addEventListener("click", () => {
+    try { window.api.bleCancelScan?.(); } catch {}
+    hideBlePicker();
+  });
+  document.getElementById("btn-ble-rescan")?.addEventListener("click", () => {
+    // Rescan = restart the chooser session. bleConnect() guards re-entrancy,
+    // and its first action will reset picker.scanEnded + candidates and
+    // re-render to the "Looking…" empty state.
+    bleConnect();
+  });
+  document.getElementById("btn-ble-forget")?.addEventListener("click", () => {
+    if (!confirm("Forget the saved HotSpot? The next scan will show the picker again.")) return;
+    forgetSavedDevice();
+    picker.preferredId = "";
+    renderBlePicker();
+  });
+  window.api.onBleCandidates?.((payload) => showBlePicker(payload));
+}
+
 function initBLE() {
   document.getElementById("btn-ble-connect")?.addEventListener("click", bleConnect);
   document.getElementById("btn-ble-disconnect")?.addEventListener("click", bleDisconnect);
   document.getElementById("btn-ble-quickconnect")?.addEventListener("click", bleConnect);
+  initBlePickerUI();
 
   const input = document.getElementById("dtmf-input");
   const send = document.getElementById("dtmf-send");
@@ -1521,7 +1718,7 @@ async function main() {
   const cfg = await window.api.loadSettings();
   applyConfig(cfg);
 
-  try { window.api.setPreferredBleName?.(getSavedDeviceName()); } catch {}
+  try { window.api.setPreferredBleId?.(getSavedDeviceId()); } catch {}
   setBleStatus("Not connected", "");
 
   renderFeed();

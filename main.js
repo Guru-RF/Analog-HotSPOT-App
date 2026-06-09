@@ -9,7 +9,56 @@ app.setName("HotSpot");
 let mainWindow;
 let settingsWindow = null;
 let tray = null;
-let preferredBleName = "";
+// Stable platform BLE identifier (Electron's `deviceId`) for the last hotspot
+// the user connected to. Survives firmware re-flashes that change the
+// advertised name. Empty = no saved preference, the user gets the picker.
+let preferredBleId = "";
+
+// Module-scoped picker state — the IPC handlers at the bottom need access,
+// but the chooser event itself is registered per-window in createWindow().
+const BLE_RESOLUTION_WINDOW_MS = 3000;
+const BLE_INTERACTIVE_SCAN_MS = 30000;
+let bleScanTimeout = null;
+let bleResolutionTimeout = null;
+let bleCurrentCallback = null;
+let bleLatestDevices = [];
+let blePickerActive = false;
+
+function clearBleTimers() {
+  if (bleScanTimeout) { clearTimeout(bleScanTimeout); bleScanTimeout = null; }
+  if (bleResolutionTimeout) { clearTimeout(bleResolutionTimeout); bleResolutionTimeout = null; }
+}
+function pushBleCandidates() {
+  if (!mainWindow || mainWindow.isDestroyed()) return;
+  mainWindow.webContents.send("ble:candidates", {
+    devices: bleLatestDevices.map((d) => ({
+      deviceId: d.deviceId,
+      deviceName: d.deviceName || "",
+    })),
+    preferredId: preferredBleId || "",
+  });
+}
+function resolveBleCallback(deviceId) {
+  const cb = bleCurrentCallback;
+  clearBleTimers();
+  bleCurrentCallback = null;
+  blePickerActive = false;
+  if (cb) try { cb(deviceId || ""); } catch (_) {}
+}
+function decideBleAfterResolution() {
+  bleResolutionTimeout = null;
+  const list = bleLatestDevices;
+  if (list.length === 1) {
+    const only = list[0];
+    if (!preferredBleId || only.deviceId === preferredBleId) {
+      resolveBleCallback(only.deviceId);
+      return;
+    }
+  }
+  // Multiple candidates / saved id absent / zero hits → open the picker.
+  blePickerActive = true;
+  pushBleCandidates();
+}
 
 function getSettingsPath() {
   return path.join(app.getPath("userData"), "settings.json");
@@ -119,58 +168,38 @@ function createWindow() {
     return { action: "deny" };
   });
 
-  // Web Bluetooth picker — auto-select the last-paired device, or the first
-  // match. requestDevice() already filtered by our service UUID, so anything
-  // in `devices` is a HotSpot-protocol peer — picking the first after a short
-  // grace period is safe even if the saved name doesn't show up (renamed box,
-  // a different unit at a club site, etc.). Without that fallback the picker
-  // would wait the full timeout and then cancel, hiding an in-range hotspot
-  // whose advertised name simply differs from the one we saw last time.
-  let bleScanTimeout = null;
-  let bleFallbackTimeout = null;
-  let bleCurrentCallback = null;
-  let bleLatestDevices = [];
-  const clearBleTimers = () => {
-    if (bleScanTimeout)     { clearTimeout(bleScanTimeout);     bleScanTimeout = null; }
-    if (bleFallbackTimeout) { clearTimeout(bleFallbackTimeout); bleFallbackTimeout = null; }
-  };
+  // Web Bluetooth picker — mirrors the Flutter mobile app's
+  // `BleService.scanAndConnect`:
+  //   1. Phase 1 ("resolution window", 3 s): let advertisements accumulate.
+  //   2. After the window, if EXACTLY ONE HotSpot is in range AND its
+  //      deviceId matches preferredBleId (or no preference is saved),
+  //      auto-connect.
+  //   3. Otherwise hand the candidate list to the renderer's picker overlay
+  //      and keep the scan alive for up to 30 s so late-arriving hotspots
+  //      show up.
+  //   4. Renderer responds with `ble:choose` / `ble:cancel-scan`, else the
+  //      30 s cap fires cb("") and aborts.
+  // Module-level helpers do the heavy lifting; this handler is just the
+  // chooser-event entrypoint.
   mainWindow.webContents.on("select-bluetooth-device", (event, devices, callback) => {
     event.preventDefault();
+    // Defense in depth against the renderer somehow firing two
+    // requestDevice() calls concurrently — the renderer already gates on
+    // `ble.scanning`, but if that ever leaks (DevTools, future refactor),
+    // releasing the orphaned callback prevents the first promise from
+    // hanging forever and pinning the UI on "Scanning…".
+    if (bleCurrentCallback && bleCurrentCallback !== callback) {
+      try { bleCurrentCallback(""); } catch (_) {}
+    }
     bleCurrentCallback = callback;
     bleLatestDevices = devices;
-    const preferred = preferredBleName;
-    const exact = preferred && devices.find((d) => d.deviceName === preferred);
-    if (exact) {
-      clearBleTimers();
-      bleCurrentCallback = null;
-      return callback(exact.deviceId);
+    if (blePickerActive) {
+      pushBleCandidates();
+      return;
     }
-    if (devices.length > 0 && !preferred) {
-      clearBleTimers();
-      bleCurrentCallback = null;
-      return callback(devices[0].deviceId);
-    }
-    // Saved name set but not (yet) seen: wait briefly in case it advertises
-    // late, then fall back to whatever HotSpot device is already visible.
-    if (devices.length > 0 && preferred && !bleFallbackTimeout) {
-      bleFallbackTimeout = setTimeout(() => {
-        bleFallbackTimeout = null;
-        const cb = bleCurrentCallback;
-        bleCurrentCallback = null;
-        if (!cb) return;
-        const list = bleLatestDevices;
-        const pick = (preferred && list.find((d) => d.deviceName === preferred)) || list[0];
-        try { cb(pick ? pick.deviceId : ""); } catch (_) {}
-      }, 3000);
-    }
-    // Hard cap: cancel after 15 s if we never see any device.
-    if (!bleScanTimeout) {
-      bleScanTimeout = setTimeout(() => {
-        bleScanTimeout = null;
-        const cb = bleCurrentCallback;
-        bleCurrentCallback = null;
-        if (cb) try { cb(""); } catch (_) {}
-      }, 15000);
+    if (!bleResolutionTimeout && !bleScanTimeout) {
+      bleResolutionTimeout = setTimeout(decideBleAfterResolution, BLE_RESOLUTION_WINDOW_MS);
+      bleScanTimeout = setTimeout(() => resolveBleCallback(""), BLE_INTERACTIVE_SCAN_MS);
     }
   });
 
@@ -438,9 +467,33 @@ ipcMain.handle("window:getOnTop", () => mainWindow.isAlwaysOnTop());
 ipcMain.on("window:minimize", () => mainWindow.minimize());
 ipcMain.on("window:close", () => mainWindow.close());
 
-ipcMain.on("ble:preferred-name", (_event, name) => {
-  preferredBleName = name || "";
+// Stable platform deviceId of the saved hotspot. Replaces the legacy
+// `ble:preferred-name` channel — a name change on the hotspot side no
+// longer breaks auto-connect.
+ipcMain.on("ble:preferred-id", (_event, id) => {
+  preferredBleId = id || "";
 });
+
+// Renderer's picker UI sends one of these in response to a `ble:candidates`
+// push. `choose` resolves the still-pending requestDevice() callback with
+// the selected deviceId; `cancel` resolves it with "" to abort the scan.
+ipcMain.on("ble:choose", (_event, deviceId) => {
+  if (!blePickerActive) return;
+  // The candidate list can change between render and click — a peripheral
+  // that went away during the user's reaction time would no longer be in
+  // `bleLatestDevices`. Resolving with a stale id makes Chromium reject
+  // with NotFoundError; rejecting it ourselves with cb("") gives the
+  // renderer a clean error path and keeps the picker open for retry.
+  const known = bleLatestDevices.some((d) => d.deviceId === deviceId);
+  resolveBleCallback(known ? deviceId : "");
+});
+ipcMain.on("ble:cancel-scan", () => {
+  if (!blePickerActive) return;
+  resolveBleCallback("");
+});
+// "Forget HotSpot" → clear the saved id so the next scan opens the picker
+// even if a single hotspot is in range.
+ipcMain.on("ble:forget", () => { preferredBleId = ""; });
 
 // Tray ticker + dropdown — macOS: current talker shows next to the tray icon
 // in the menu bar; right-click opens a menu with live state and actions.

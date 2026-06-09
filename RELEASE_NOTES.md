@@ -23,6 +23,14 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.8
+
+- **Multi-hotspot picker** (mirrors the Flutter mobile app's `hotspot_picker_sheet`). When more than one HotSpot is in range — or your saved one isn't visible — a modal picker shows the list, sorted with the saved hotspot floated to the top under a green "Last used" chip. Tap to connect, **Rescan** to retry, **Forget** to clear the saved hotspot.
+- **Identity is now the BLE remote-id**, not the advertised name. A hotspot that gets renamed (firmware reflash, hostname change) is still auto-connected to on the next launch because the platform-stable id stays the same.
+- **3-second resolution window** before deciding between auto-connect and picker: exactly one HotSpot in range that matches the saved id (or no saved id) → silent auto-connect; everything else → picker.
+- **No more "stuck on Scanning…"** if you double-click the connect button or trigger a scan from two places at once — the renderer now guards re-entrancy and the main process releases orphaned chooser callbacks.
+- The picker stays open after a failed connect so you can try a different candidate without restarting the scan. After 30 s with no devices visible, the empty state flips to "No HotSpots found in range — click Rescan."
+
 ## What's new in 1.0.7
 
 - **Update notifier.** The app polls GitHub's `releases/latest` for `Guru-RF/Analog-HotSPOT-App` at startup and once a day after. When a newer tag appears, a red `vX.Y.Z available` pill shows in the title bar — click it to open <https://svxlink-hotspot.app>.
