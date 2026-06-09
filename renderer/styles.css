@@ -6,15 +6,15 @@
   color-scheme: light;
   --bg: #ffffff;
   --fg: #0f172a;
-  --muted: #64748b;
+  --muted: #475569;       /* up from #64748b — WCAG AA on #ffffff */
   --chip: #eef2ff;
-  --ok: #0a7;
-  --ok-visited: #075;
+  --ok: #047857;          /* deeper green — WCAG AA on #ffffff and the chip bg */
+  --ok-visited: #065f46;
   --bad: #b00;
   --border: #e5e7eb;
   --panel: #f8fafc;
   --accent: #a52a2a;
-  --hotspot: #ffa502;
+  --hotspot: #b8650a;     /* deeper amber — WCAG AA in light theme */
 
   --titlebarH: 36px;
 }
@@ -979,7 +979,7 @@ main.sp-body {
 .update-pill {
   background: #d92929;
   color: #ffffff;
-  border: 0;
+  border: 1px solid #b21f1f; /* visible against the red panel bar on Win/Linux */
   border-radius: 999px;
   padding: 3px 10px;
   margin: 0 6px 0 2px;
@@ -988,9 +988,19 @@ main.sp-body {
   text-transform: uppercase;
   cursor: pointer;
   -webkit-app-region: no-drag;
-  transition: background 0.12s;
+  transition: background 0.12s, color 0.12s;
 }
-.update-pill:hover { background: #b21f1f; }
+.update-pill:hover  { background: #b21f1f; color: #ffffff; }
+.update-pill:focus-visible { outline: 2px solid #ffffff; outline-offset: 2px; }
+/* "Opened" state — muted so the user sees the click landed but the pill
+   no longer shouts for attention. */
+.update-pill.opened {
+  background: transparent;
+  color: var(--muted);
+  border-color: var(--border);
+  cursor: default;
+}
+.update-pill.opened:hover { background: transparent; color: var(--muted); }
 
 /* ============================================================
    BLE multi-hotspot picker overlay

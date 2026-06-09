@@ -5,6 +5,15 @@
     <title>HotSpot</title>
     <meta name="viewport" content="width=device-width,initial-scale=1" />
     <meta name="color-scheme" content="dark light" />
+    <!-- CSP — defence in depth on top of contextIsolation. The reflector
+         WSS endpoint and portal.<domain>/talkgroups.json are user-configured
+         hostnames, so we allow `wss:` and `https:` broadly here and rely on
+         the renderer's `isSafeHostname` allowlist to refuse anything that
+         isn't a bare hostname (no `file:`, no `javascript:`, no `@` etc.).
+         `script-src 'self'` still forbids inline scripts + remote-loaded
+         code. `frame-ancestors` is unsupported via <meta> (only valid as a
+         response header) so we omit it. -->
+    <meta http-equiv="Content-Security-Policy" content="default-src 'self'; script-src 'self'; style-src 'self' 'unsafe-inline'; img-src 'self' data: https://*.tile.openstreetmap.org https://tile.openstreetmap.org; connect-src 'self' https: wss:; font-src 'self' data:; object-src 'none'; base-uri 'none'; form-action 'none'" />
     <link rel="stylesheet" href="./vendor/leaflet/leaflet.css" />
     <link rel="stylesheet" href="./styles.css" />
   </head>
@@ -31,11 +40,11 @@
     <!-- BLE picker overlay (multi-hotspot) — hidden until main process pushes
          candidates after the 3-s resolution window. Mirrors the mobile app's
          hotspot_picker_sheet.dart. -->
-    <div id="ble-picker-overlay" class="hidden" role="dialog" aria-modal="true">
+    <div id="ble-picker-overlay" class="hidden" role="dialog" aria-modal="true" aria-labelledby="ble-picker-title">
       <div id="ble-picker">
         <div id="ble-picker-header">
           <div class="ble-picker-titles">
-            <span class="ble-picker-title">Nearby HotSpots</span>
+            <span class="ble-picker-title" id="ble-picker-title">Nearby HotSpots</span>
             <span class="ble-picker-sub" id="ble-picker-sub">Scanning…</span>
           </div>
           <button class="tb-btn" id="btn-ble-forget" title="Forget the saved HotSpot">Forget</button>

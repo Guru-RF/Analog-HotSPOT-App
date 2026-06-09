@@ -16,6 +16,7 @@ contextBridge.exposeInMainWorld("api", {
 
   minimize: () => ipcRenderer.send("window:minimize"),
   close: () => ipcRenderer.send("window:close"),
+  toggleMaximize: () => ipcRenderer.send("window:toggle-maximize"),
 
   toggleOnTop: () => ipcRenderer.invoke("window:toggleOnTop"),
   getOnTop: () => ipcRenderer.invoke("window:getOnTop"),
@@ -34,8 +35,21 @@ contextBridge.exposeInMainWorld("api", {
   onSendDtmfRequest: (cb) =>
     ipcRenderer.on("ble:send-dtmf", (_e, dtmf) => cb(dtmf)),
 
-  // Update available pill
+  // Update pill
   onUpdateAvailable: (cb) =>
     ipcRenderer.on("update:available", (_e, info) => cb(info)),
   openUpdateUrl: () => ipcRenderer.send("update:open"),
+  checkUpdateNow: () => ipcRenderer.invoke("update:check-now"),
+
+  // "I'm ready" — drains any update broadcast that fired before the
+  // renderer's listener was wired.
+  rendererReady: () => ipcRenderer.send("renderer:ready"),
+
+  // Power state — give the BLE/WSS code a chance to flush/reconnect cleanly
+  // around OS sleep/wake.
+  onPowerSuspend: (cb) => ipcRenderer.on("power:suspend", () => cb()),
+  onPowerResume:  (cb) => ipcRenderer.on("power:resume",  () => cb()),
+
+  // Last-chance signal before main quits — close WSS + BLE cleanly.
+  onBeforeQuit: (cb) => ipcRenderer.on("app:before-quit", () => cb()),
 });

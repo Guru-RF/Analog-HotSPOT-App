@@ -74,13 +74,30 @@ const state = {
 };
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
+// Strip Unicode bidi-control characters that could otherwise flip text
+// direction inside the talker table / picker tiles ("RTL override" trick).
+// U+202A..U+202E (legacy embedding/override), U+2066..U+2069 (isolates),
+// plus the zero-width joiner / non-joiner / BOM / variation selectors that
+// can be used for homoglyph-style spoofing.
+const BIDI_AND_ZERO_WIDTH = /[​-‏‪-‮⁠-⁩﻿]/g;
 function escapeHtml(s) {
   return String(s ?? "")
+    .replace(BIDI_AND_ZERO_WIDTH, "")
     .replace(/&/g, "&amp;")
     .replace(/</g, "&lt;")
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+// Validates that a hostname-only string is safe to use as the host part of a
+// wss:// or https:// URL. No schemes, no slashes, no @userinfo, no ports.
+const HOSTNAME_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+function isSafeHostname(s) {
+  if (typeof s !== "string") return false;
+  const t = s.trim().toLowerCase();
+  if (!t || t.length > 253) return false;
+  return HOSTNAME_RE.test(t);
 }
 
 function msAgoLabel(deltaMs) {
@@ -316,6 +333,14 @@ function renderTgBar() {
   }
 }
 
+// Differential renderer for the last-talkers table. Was previously a wholesale
+// innerHTML rebuild every 1 s, which dropped any in-progress text selection,
+// allocated ~1 k cell nodes per second forever, and re-parsed all 500 rows of
+// HTML on every tick. The keyed approach only touches the cells that actually
+// changed (Duration + Heard, plus the dot class when active → ended).
+const renderedRows = new Map(); // key → { tr, dur, heard, dot, classes }
+const rowKey = (s) => (s.cs || "?") + "|" + (s.startedAt || 0);
+
 function renderTable() {
   if (!tbody) return;
   const limit = state.historyLimit;
@@ -323,29 +348,77 @@ function renderTable() {
   const now = Date.now();
 
   if (rows.length === 0) {
+    if (tbody.firstChild?.classList?.contains("emptyRow")) return;
     tbody.innerHTML = `<tr class="emptyRow"><td colspan="5">No talkers yet.</td></tr>`;
+    renderedRows.clear();
     return;
   }
 
-  tbody.innerHTML = rows
-    .map((s) => {
-      const active = !s.endedAt && !s.historical;
-      const dotCls = active ? "dotOnline" : "dotOffline";
-      const dur = active
-        ? `<span class="timeNow">Now</span>`
-        : s.historical ? "—" : durationLabel((s.endedAt || now) - s.startedAt);
-      const heard = active ? `<span class="timeNow">Now</span>` : msAgoLabel(now - (s.endedAt || s.startedAt));
-      const tg = s.tg ? escapeHtml(s.tg) : "—";
-      return `
-        <tr class="${active ? "talkingRow" : ""}">
-          <td class="narrow center"><span class="${dotCls}"></span></td>
-          <td><strong>${escapeHtml(s.cs)}</strong></td>
-          <td>${tg}</td>
-          <td class="center">${dur}</td>
-          <td class="center">${heard}</td>
-        </tr>`;
-    })
-    .join("");
+  const seen = new Set();
+  // Build the desired order; insert any new rows at the right spot, leave
+  // existing rows in place if the order didn't change. innerHTML on the
+  // <tr> level only — the <tbody> itself stays the same DOM node so text
+  // selection inside an unchanged row survives the tick.
+  let prevTr = null;
+  for (const s of rows) {
+    const key = rowKey(s);
+    seen.add(key);
+    const active = !s.endedAt && !s.historical;
+    const dotCls = active ? "dotOnline" : "dotOffline";
+    const dur = active
+      ? `<span class="timeNow">Now</span>`
+      : s.historical ? "—" : durationLabel((s.endedAt || now) - s.startedAt);
+    const heard = active
+      ? `<span class="timeNow">Now</span>`
+      : msAgoLabel(now - (s.endedAt || s.startedAt));
+    const tg = s.tg ? escapeHtml(s.tg) : "—";
+    const trClass = active ? "talkingRow" : "";
+
+    let cached = renderedRows.get(key);
+    if (!cached) {
+      const tr = document.createElement("tr");
+      tr.className = trClass;
+      tr.innerHTML = `
+        <td class="narrow center"><span class="${dotCls}"></span></td>
+        <td><strong>${escapeHtml(s.cs)}</strong></td>
+        <td>${tg}</td>
+        <td class="center">${dur}</td>
+        <td class="center">${heard}</td>`;
+      cached = {
+        tr,
+        dotEl: tr.querySelector("td.narrow span"),
+        durCell: tr.cells[3],
+        heardCell: tr.cells[4],
+        tgCell: tr.cells[2],
+        signature: dur + "|" + heard + "|" + tg + "|" + trClass,
+      };
+      renderedRows.set(key, cached);
+    } else {
+      const sig = dur + "|" + heard + "|" + tg + "|" + trClass;
+      if (sig !== cached.signature) {
+        if (cached.tr.className !== trClass) cached.tr.className = trClass;
+        if (cached.dotEl && cached.dotEl.className !== dotCls) cached.dotEl.className = dotCls;
+        if (cached.durCell.innerHTML !== dur) cached.durCell.innerHTML = dur;
+        if (cached.heardCell.innerHTML !== heard) cached.heardCell.innerHTML = heard;
+        if (cached.tgCell.innerHTML !== tg) cached.tgCell.innerHTML = tg;
+        cached.signature = sig;
+      }
+    }
+
+    const desiredPrev = prevTr ? prevTr.nextSibling : tbody.firstChild;
+    if (cached.tr !== desiredPrev) {
+      tbody.insertBefore(cached.tr, desiredPrev || null);
+    }
+    prevTr = cached.tr;
+  }
+
+  // Drop rows no longer in view.
+  for (const [key, cached] of renderedRows) {
+    if (!seen.has(key)) {
+      try { cached.tr.remove(); } catch (_) {}
+      renderedRows.delete(key);
+    }
+  }
 }
 
 // ── Info screen rendering ─────────────────────────────────────────────────────
@@ -460,6 +533,15 @@ const ble = {
   // chooser callback bound to ONE pending request, so two pending requests
   // means the first callback gets orphaned and its promise hangs forever.
   scanning: false,
+  // Monotonic id of the current connection attempt. bleConnect()/
+  // bleTryReconnect() each bump this and capture the value; any work whose
+  // generation no longer matches must abort (prevents an in-flight
+  // bleTryReconnect from overwriting ble.* after bleConnect picked a new
+  // device).
+  generation: 0,
+  // Per-connection AbortController. addEventListener calls signal off this
+  // so stale notification handlers from previous reconnects don't pile up.
+  abort: null,
 };
 
 function getSavedDeviceName() {
@@ -487,6 +569,11 @@ function forgetSavedDevice() {
   try { localStorage.removeItem(BLE_LAST_DEVICE); } catch {}
   try { localStorage.removeItem(BLE_LAST_DEVICE_ID); } catch {}
   try { window.api.bleForget?.(); } catch {}
+  // Block the in-flight bleConnect's saveDeviceIdentity from silently
+  // re-saving the id the user just removed. The picker also hides the
+  // Forget button while selectedId is set, but this belt-and-braces
+  // covers any future code path that might not.
+  ble.forgetPending = true;
 }
 
 function setBleStatus(text, cls) {
@@ -554,9 +641,12 @@ function setDtmfResponse(text, cls) {
   el.className = cls || "";
 }
 
-async function bleSetupCharacteristics(device) {
+async function bleSetupCharacteristics(device, generation) {
   const server = device.gatt.connected ? device.gatt : await device.gatt.connect();
+  // Bail if the user has since reconnected to a different device.
+  if (generation !== ble.generation) return;
   const service = await server.getPrimaryService(BLE_SVC_UUID);
+  if (generation !== ble.generation) return;
   const writeChar = await service.getCharacteristic(BLE_WRITE_UUID);
   const statusChar = await service.getCharacteristic(BLE_STATUS_UUID);
 
@@ -566,15 +656,29 @@ async function bleSetupCharacteristics(device) {
   let feedChar = null;
   try { feedChar = await service.getCharacteristic(BLE_FEED_UUID); } catch (_) {}
 
+  // Tear down any prior connection's listeners. Mobile flutter_blue_plus
+  // re-creates the characteristic object on every connect; Web Bluetooth in
+  // Chromium reuses the SAME characteristic object across GATT reconnects to
+  // the same device, so without removeEventListener (or AbortController) the
+  // ingestFeed callback would pile up: N reconnects → N feed callbacks per
+  // notification → renderTable runs N times → render thrash + listener leak.
+  if (ble.abort) { try { ble.abort.abort(); } catch (_) {} }
+  ble.abort = new AbortController();
+  const signal = ble.abort.signal;
+
+  try { await statusChar.stopNotifications(); } catch (_) {}
   await statusChar.startNotifications();
+  if (generation !== ble.generation) return;
   statusChar.addEventListener("characteristicvaluechanged", (e) => {
     const text = new TextDecoder().decode(e.target.value);
     const isErr = text.startsWith("err");
     setDtmfResponse(text, isErr ? "bad" : "ok");
-  });
+  }, { signal });
 
   if (feedChar) {
+    try { await feedChar.stopNotifications(); } catch (_) {}
     await feedChar.startNotifications();
+    if (generation !== ble.generation) return;
     feedChar.addEventListener("characteristicvaluechanged", (e) => {
       const text = new TextDecoder().decode(e.target.value);
       try {
@@ -583,7 +687,7 @@ async function bleSetupCharacteristics(device) {
       } catch (err) {
         console.warn("Feed parse failed:", err, text);
       }
-    });
+    }, { signal });
   }
 
   ble.device = device;
@@ -626,19 +730,23 @@ async function bleTryReconnect() {
   ble.reconnectTimer = null;
   if (ble.userDisconnected || !ble.device) return;
   if (ble.reconnecting) return;
+  if (ble.scanning) return; // bleConnect is running; let it win
 
   ble.reconnecting = true;
   ble.reconnectAttempt += 1;
   const n = ble.reconnectAttempt;
+  const gen = ++ble.generation;
   setBleStatus("Reconnecting…", "connecting");
   try {
-    await bleSetupCharacteristics(ble.device);
+    await bleSetupCharacteristics(ble.device, gen);
+    if (gen !== ble.generation) { ble.reconnecting = false; return; }
     ble.reconnecting = false;
     ble.reconnectAttempt = 0;
     saveDeviceIdentity(ble.device.id, ble.device.name);
     setBleStatus(ble.device.name || "Connected", "connected");
     startKeepalive();
   } catch (_) {
+    if (gen !== ble.generation) { ble.reconnecting = false; return; }
     ble.reconnecting = false;
     const delay = Math.min(15000, 1000 * Math.pow(1.6, n - 1));
     scheduleReconnect(delay);
@@ -678,15 +786,25 @@ async function bleConnect() {
   }
   ble.writeChar = ble.statusChar = ble.cmdChar = ble.feedChar = null;
   ble.userDisconnected = false;
+  // Tear down any prior listeners (gattserverdisconnected + characteristic
+  // notification handlers from a previous connection cycle).
+  if (ble.abort) { try { ble.abort.abort(); } catch (_) {} ble.abort = null; }
+  const gen = ++ble.generation;
 
   try {
     setBleStatus("Scanning…", "connecting");
     const device = await navigator.bluetooth.requestDevice({
       filters: [{ services: [BLE_SVC_UUID] }],
     });
+    if (gen !== ble.generation) { ble.scanning = false; return; }
 
     setBleStatus(`Connecting to ${device.name || "device"}…`, "connecting");
+    // The next bleSetupCharacteristics call creates ble.abort; bind the
+    // disconnect listener through the SAME signal so the listener is
+    // garbage-collected when we re-attach on next reconnect.
+    if (!ble.abort) ble.abort = new AbortController();
     device.addEventListener("gattserverdisconnected", () => {
+      if (gen !== ble.generation) return; // already replaced by a fresh connect
       stopKeepalive();
       ble.writeChar = ble.statusChar = ble.cmdChar = ble.feedChar = null;
       if (ble.userDisconnected) {
@@ -698,9 +816,14 @@ async function bleConnect() {
       }
     });
 
-    await bleSetupCharacteristics(device);
+    await bleSetupCharacteristics(device, gen);
+    if (gen !== ble.generation) { ble.scanning = false; return; }
     ble.scanning = false;
-    saveDeviceIdentity(device.id, device.name);
+    // ForgetSavedDevice may have fired while the GATT connect was in flight;
+    // honour the user's intent and DON'T silently re-save the id they just
+    // removed. forgetSavedDevice() sets ble.forgetPending = true.
+    if (!ble.forgetPending) saveDeviceIdentity(device.id, device.name);
+    ble.forgetPending = false;
     setBleStatus(device.name || "Connected", "connected");
     startKeepalive();
   } catch (err) {
@@ -709,25 +832,22 @@ async function bleConnect() {
     const msg = err.message || "Connect failed";
     const cancelled = /cancel/i.test(msg) || err.name === "NotFoundError";
     // Picker stays visible so the user can retry without re-triggering the
-    // whole scan loop. Clear the spinner so other tiles re-enable, and on a
-    // 30 s NotFoundError flip to the "scan ended" empty state with Rescan.
+    // whole scan loop. Clear the spinner so other tiles re-enable. Flip to
+    // the "scan ended" empty state on a cancelled / 30 s NotFoundError, even
+    // if some candidates accumulated — clicks on those stale tiles were
+    // dropped by the cancelled scan anyway.
     picker.selectedId = null;
     if (picker.visible) {
-      if (cancelled && picker.candidates.length === 0) picker.scanEnded = true;
+      if (cancelled) picker.scanEnded = true;
       renderBlePicker();
     }
     setBleStatus(cancelled ? "Not connected" : msg, cancelled ? "" : "error");
   }
 }
 
-async function bleAutoReconnectOnStartup() {
-  // Either persistence key is enough — id is preferred but a v1.0.7-era
-  // install that only has the name still gets an auto-scan, just with the
-  // picker popping up at the end of the resolution window.
-  if (!getSavedDeviceId() && !getSavedDeviceName()) return;
-  await bleConnect();
-}
-window.bleAutoReconnectOnStartup = bleAutoReconnectOnStartup;
+// bleAutoReconnectOnStartup is hoisted into the Main section below so the
+// startup race (renderer.setPreferredBleId must reach main BEFORE the
+// chooser event fires) can be coordinated alongside the rest of bootstrap.
 
 async function bleDisconnect() {
   ble.userDisconnected = true;
@@ -869,19 +989,68 @@ function showBlePicker(payload) {
     picker.preferredId = String(payload?.preferredId || "");
     return;
   }
+  const wasVisible = picker.visible;
   picker.candidates = Array.isArray(payload?.devices) ? payload.devices : [];
   picker.preferredId = String(payload?.preferredId || "");
   picker.visible = true;
   picker.scanEnded = false;
   renderBlePicker();
+  if (!wasVisible) {
+    pickerPrevFocus = document.activeElement;
+    // Autofocus the first interactive element so keyboard users land in the
+    // dialog without a screen reader announcing "unlabeled dialog open".
+    const els = focusableInPicker();
+    if (els.length) els[0].focus();
+  }
 }
 
 function hideBlePicker() {
+  const wasVisible = picker.visible;
   picker.visible = false;
   picker.selectedId = null;
   picker.candidates = [];
   picker.scanEnded = false;
   renderBlePicker();
+  if (wasVisible && pickerPrevFocus && typeof pickerPrevFocus.focus === "function") {
+    try { pickerPrevFocus.focus(); } catch (_) {}
+  }
+  pickerPrevFocus = null;
+}
+
+// Element that had focus when the picker opened — restored on close so the
+// keyboard user lands back where they were (typically btn-ble-quickconnect).
+let pickerPrevFocus = null;
+
+function focusableInPicker() {
+  const overlay = document.getElementById("ble-picker-overlay");
+  if (!overlay) return [];
+  return Array.from(overlay.querySelectorAll(
+    'button:not([disabled]), [href], input:not([disabled]), [tabindex]:not([tabindex="-1"])'
+  )).filter((el) => el.offsetParent !== null);
+}
+
+function onPickerKeyDown(e) {
+  if (!picker.visible) return;
+  if (e.key === "Escape") {
+    e.preventDefault();
+    try { window.api.bleCancelScan?.(); } catch {}
+    hideBlePicker();
+    return;
+  }
+  if (e.key === "Tab") {
+    // Focus trap so Tab can't drop the user behind the modal backdrop.
+    const els = focusableInPicker();
+    if (els.length === 0) return;
+    const first = els[0];
+    const last = els[els.length - 1];
+    if (e.shiftKey && document.activeElement === first) {
+      e.preventDefault();
+      last.focus();
+    } else if (!e.shiftKey && document.activeElement === last) {
+      e.preventDefault();
+      first.focus();
+    }
+  }
 }
 
 function initBlePickerUI() {
@@ -910,6 +1079,8 @@ function initBlePickerUI() {
     renderBlePicker();
   });
   window.api.onBleCandidates?.((payload) => showBlePicker(payload));
+  // Focus / keyboard a11y — Esc closes, Tab traps inside the dialog.
+  document.addEventListener("keydown", onPickerKeyDown);
 }
 
 function initBLE() {
@@ -980,6 +1151,9 @@ function reflectorReset() {
   if (reflectorFeed.reconnectTimer) { clearTimeout(reflectorFeed.reconnectTimer); reflectorFeed.reconnectTimer = null; }
   if (reflectorFeed.snapshotTimer)  { clearTimeout(reflectorFeed.snapshotTimer);  reflectorFeed.snapshotTimer = null; }
   if (reflectorFeed.ws) {
+    // Detach handlers BEFORE close so a fire-and-forget "close" event on the
+    // old socket doesn't reschedule a reconnect that races with the new ws.
+    try { reflectorFeed.ws.onopen = reflectorFeed.ws.onmessage = reflectorFeed.ws.onerror = reflectorFeed.ws.onclose = null; } catch (_) {}
     try { reflectorFeed.ws.close(1000); } catch (_) {}
     reflectorFeed.ws = null;
   }
@@ -1005,12 +1179,23 @@ function reflectorSetDomain(domain, enabled) {
   reflectorConnect();
 }
 
+// Frame size cap — a hostile reflector could otherwise stream a multi-MB
+// payload that JSON.parse would chew through on the main thread for seconds.
+const REFLECTOR_FRAME_MAX_BYTES = 4 * 1024 * 1024;
+// Backoff ceiling for sustained failures (typo'd domain → don't hammer the
+// real endpoint at 15 s intervals forever).
+const REFLECTOR_BACKOFF_MAX_MS = 5 * 60 * 1000;
+let reflectorFailures = 0;
+
 function reflectorConnect() {
   if (reflectorFeed.disposed) return;
   if (!state.reflector.domain || !state.reflector.enabled) return;
 
   const host = normalizeReflectorHost(state.reflector.domain);
-  if (!host) { setReflectorAvailable(false); return; }
+  // Hostname allowlist — refuse anything that doesn't parse as a bare host
+  // (defeats `javascript:`, `file://`, embedded `@`, etc., that could have
+  // slipped past `normalizeReflectorHost`'s scheme-strip).
+  if (!host || !isSafeHostname(host)) { setReflectorAvailable(false); return; }
 
   let ws;
   try {
@@ -1021,8 +1206,21 @@ function reflectorConnect() {
   }
   reflectorFeed.ws = ws;
 
+  // Capture the local reference and guard each handler — if a fresh
+  // reflectorConnect re-assigns reflectorFeed.ws while this socket's events
+  // are still in flight, we ignore them. Without the guard, a stale close
+  // event would call scheduleReconnect that races with the new connection
+  // and toggles `available` back to false.
+  const isCurrent = () => reflectorFeed.ws === ws;
+
+  ws.onopen = () => { if (isCurrent()) reflectorFailures = 0; };
   ws.onmessage = (ev) => {
+    if (!isCurrent()) return;
     if (typeof ev.data !== "string") return;
+    if (ev.data.length > REFLECTOR_FRAME_MAX_BYTES) {
+      console.warn("[reflector] dropped oversize frame", ev.data.length);
+      return;
+    }
     let obj;
     try { obj = JSON.parse(ev.data); } catch (_) { return; }
     if (!obj || typeof obj !== "object") return;
@@ -1031,8 +1229,8 @@ function reflectorConnect() {
     else if (type === "node_upsert") reflectorHandleNodeUpsert(obj.node);
     else if (type === "talk_start" || type === "talk_stop") reflectorHandleTalkEvent(obj.session);
   };
-  ws.onerror = () => reflectorScheduleReconnect();
-  ws.onclose = () => reflectorScheduleReconnect();
+  ws.onerror = () => { if (isCurrent()) reflectorScheduleReconnect(); };
+  ws.onclose = () => { if (isCurrent()) reflectorScheduleReconnect(); };
 
   if (reflectorFeed.snapshotTimer) clearTimeout(reflectorFeed.snapshotTimer);
   reflectorFeed.snapshotTimer = setTimeout(() => {
@@ -1047,12 +1245,24 @@ function reflectorScheduleReconnect() {
   if (reflectorFeed.disposed) return;
   if (!state.reflector.domain || !state.reflector.enabled) return;
   if (!reflectorFeed.gotSnapshot) setReflectorAvailable(false);
+  // Clear pending snapshot timer too — otherwise a stale snapshot timeout
+  // can fire after we've already scheduled a fresh connect and double-flip
+  // `available`.
+  if (reflectorFeed.snapshotTimer) { clearTimeout(reflectorFeed.snapshotTimer); reflectorFeed.snapshotTimer = null; }
   if (reflectorFeed.ws) {
+    try { reflectorFeed.ws.onopen = reflectorFeed.ws.onmessage = reflectorFeed.ws.onerror = reflectorFeed.ws.onclose = null; } catch (_) {}
     try { reflectorFeed.ws.close(); } catch (_) {}
     reflectorFeed.ws = null;
   }
   if (reflectorFeed.reconnectTimer) clearTimeout(reflectorFeed.reconnectTimer);
-  reflectorFeed.reconnectTimer = setTimeout(reflectorConnect, REFLECTOR_RECONNECT_MS);
+  // Exponential backoff so a misconfigured (typo'd) domain doesn't hammer the
+  // upstream every 15 s indefinitely. Reset on successful onopen.
+  reflectorFailures += 1;
+  const delay = Math.min(
+    REFLECTOR_BACKOFF_MAX_MS,
+    REFLECTOR_RECONNECT_MS * Math.pow(1.5, Math.max(0, reflectorFailures - 1))
+  );
+  reflectorFeed.reconnectTimer = setTimeout(reflectorConnect, delay);
 }
 
 function numOrNull(v) {
@@ -1272,22 +1482,43 @@ let tgUpdateTimer = null;
 
 async function fetchTalkgroupsFromUrl(url) {
   if (!url) return null;
+  // Refuse anything that isn't an HTTPS URL — `data:` / `javascript:` /
+  // `file:` payloads constructed from a hostile reflector domain would
+  // otherwise reach fetch() here.
+  try {
+    const u = new URL(url);
+    if (u.protocol !== "https:") return null;
+  } catch { return null; }
+  const ac = new AbortController();
+  const tmo = setTimeout(() => ac.abort(), 10000);
   try {
     const res = await fetch(url, {
       headers: { Accept: "application/json" },
       cache: "no-store",
+      signal: ac.signal,
     });
     if (!res.ok) return null;
-    const json = await res.json();
-    if (!json || typeof json !== "object") return null;
+    // Refuse oversized response bodies — a hostile portal could otherwise
+    // stream tens of MB of JSON and stall the renderer.
+    const lenHeader = Number(res.headers.get("content-length"));
+    if (Number.isFinite(lenHeader) && lenHeader > 2 * 1024 * 1024) return null;
+    const text = await res.text();
+    if (text.length > 2 * 1024 * 1024) return null;
+    const json = JSON.parse(text);
+    if (!json || typeof json !== "object" || Array.isArray(json)) return null;
     const out = {};
+    let count = 0;
     for (const [k, v] of Object.entries(json)) {
-      const key = String(k).trim();
-      if (key) out[key] = String(v ?? "");
+      if (count >= 500) break;
+      const key = String(k).trim().slice(0, 32);
+      const val = String(v ?? "").slice(0, 128);
+      if (key) { out[key] = val; count += 1; }
     }
     return Object.keys(out).length ? out : null;
   } catch (_) {
     return null;
+  } finally {
+    clearTimeout(tmo);
   }
 }
 
@@ -1295,11 +1526,21 @@ async function probeReflectorWss(domain) {
   // We can't do a raw HTTP Upgrade probe from a renderer without CORS issues,
   // so we attempt an actual WebSocket open with a short timeout instead.
   const host = normalizeReflectorHost(domain);
-  if (!host) return false;
+  if (!host || !isSafeHostname(host)) return false;
   return await new Promise((resolve) => {
     let done = false;
     let ws;
-    const finish = (ok) => { if (done) return; done = true; try { ws && ws.close(); } catch (_) {} resolve(ok); };
+    const finish = (ok) => {
+      if (done) return;
+      done = true;
+      try {
+        if (ws) {
+          ws.onopen = ws.onerror = ws.onclose = null;
+          ws.close();
+        }
+      } catch (_) {}
+      resolve(ok);
+    };
     try { ws = new WebSocket(`wss://${host}/`); } catch (_) { return resolve(false); }
     ws.onopen  = () => finish(true);
     ws.onerror = () => finish(false);
@@ -1315,21 +1556,25 @@ function rescheduleTgAutoUpdate() {
   if (!cfg.tgAutoUpdate) return;
   const url = (cfg.tgUpdateUrl || "").trim() || portalTalkgroupsUrlFor(cfg.reflectorDomain || "");
   if (!url) return;
+  let tickInFlight = false;
   const tick = async () => {
-    const fetched = await fetchTalkgroupsFromUrl(url);
-    if (!fetched || !Object.keys(fetched).length) return;
-    // Only persist when the data actually changed — otherwise we get
-    // settings:changed → applyConfig → rescheduleTgAutoUpdate → tick →
-    // save again, churning the WSS connection and re-fetching forever.
-    const before = JSON.stringify(state.talkgroupInfo || {});
-    const after = JSON.stringify(fetched);
-    state.talkgroupInfo = fetched;
-    state.cfg = { ...state.cfg, talkgroupInfo: fetched };
-    renderTgBar();
-    renderInfo();
-    refreshTrayTgs();
-    if (before !== after) {
-      window.api.saveSettings({ talkgroupInfo: fetched }).catch(() => {});
+    if (tickInFlight) return; // 8 h overlaps cannot happen but defend anyway
+    tickInFlight = true;
+    try {
+      const fetched = await fetchTalkgroupsFromUrl(url);
+      if (!fetched || !Object.keys(fetched).length) return;
+      const before = JSON.stringify(state.talkgroupInfo || {});
+      const after = JSON.stringify(fetched);
+      state.talkgroupInfo = fetched;
+      state.cfg = { ...state.cfg, talkgroupInfo: fetched };
+      renderTgBar();
+      renderInfo();
+      refreshTrayTgs();
+      if (before !== after) {
+        window.api.saveSettings({ talkgroupInfo: fetched }).catch(() => {});
+      }
+    } finally {
+      tickInFlight = false;
     }
   };
   tick();
@@ -1342,9 +1587,20 @@ function maybeAdoptReflectorFromFeed(rfDomain) {
   if (!rfDomain) return;
   const cfg = state.cfg || {};
   if (cfg.reflectorDomain) return;
-  state.cfg = { ...state.cfg, reflectorDomain: rfDomain };
-  window.api.saveSettings({ reflectorDomain: rfDomain }).catch(() => {});
-  reflectorSetDomain(rfDomain, cfg.wssEnabled !== false);
+  // Validate the host before persisting: a rogue BLE peripheral within range
+  // could otherwise feed `rf: "javascript:..."` or `rf: "evil.tld/path?x="`,
+  // and the renderer would open wss://reflector.evil.tld/... and persist the
+  // bogus value to settings.json. Bare-hostname allowlist only.
+  const candidate = String(rfDomain).trim()
+    .replace(/^reflector\./i, "")
+    .replace(/^portal\./i, "");
+  if (!isSafeHostname(candidate)) {
+    console.warn("[reflector] ignoring untrusted rf from feed:", rfDomain);
+    return;
+  }
+  state.cfg = { ...state.cfg, reflectorDomain: candidate };
+  window.api.saveSettings({ reflectorDomain: candidate }).catch(() => {});
+  reflectorSetDomain(candidate, cfg.wssEnabled !== false);
   if (state.cfg.tgAutoUpdate) rescheduleTgAutoUpdate();
 }
 
@@ -1499,18 +1755,31 @@ function collectQualifiedTalkers() {
 function fitToTalkers(talkers) {
   if (!mapState.map || !talkers.length) return;
   if (talkers.length === 1) {
-    fitToHome(talkers[0].lat, talkers[0].lon, TALKER_ZOOM_RADIUS_KM);
+    // animate:false — talker-driven camera moves can fire in bursts during a
+    // net; Leaflet's default animation queues these and the map judders.
+    mapState.map.setView(
+      [talkers[0].lat, talkers[0].lon],
+      Math.max(mapState.map.getZoom(), 9),
+      { animate: false }
+    );
     return;
   }
   const bounds = L.latLngBounds(talkers.map((n) => [n.lat, n.lon]));
-  mapState.map.fitBounds(bounds, { padding: [40, 40] });
+  mapState.map.fitBounds(bounds, { padding: [40, 40], animate: false });
 }
 
+// Trailing-edge debounce — coalesces bursts of qualify/unqualify events
+// during a multi-station net into one camera move per ~250 ms.
+let refitMapTimer = null;
 function refitMap() {
   if (!mapState.map) return;
-  const qualified = collectQualifiedTalkers();
-  if (qualified.length) fitToTalkers(qualified);
-  else fitMapInitial();
+  if (refitMapTimer) clearTimeout(refitMapTimer);
+  refitMapTimer = setTimeout(() => {
+    refitMapTimer = null;
+    const qualified = collectQualifiedTalkers();
+    if (qualified.length) fitToTalkers(qualified);
+    else fitMapInitial();
+  }, 250);
 }
 
 function updateTalkerQualifications() {
@@ -1559,42 +1828,88 @@ function nodeBadge(n) {
   return { label: "NODE", bg: "#FFA600" };
 }
 
+// callsign → { marker, sigStyle, sigPopup, lat, lon } so we only touch the
+// markers whose state actually changed. Previous renderMap cleared every
+// circleMarker and rebuilt from scratch on every WSS event, allocating ~200
+// SVG nodes/sec during a net.
+const markerCache = new Map();
+
+function buildPopupHtml(n) {
+  const isTalker = !!n.isTalker;
+  const monitored = n.monitoredTGs?.length ? `Monitors: ${n.monitoredTGs.join(", ")}` : "";
+  const badge = nodeBadge(n);
+  const badgeHtml = `<span class="map-badge" style="background:${badge.bg}">${badge.label}</span>`;
+  const talkingHtml = isTalker ? `<span class="map-badge map-badge-talking">TALKING</span>` : "";
+  const tgLabel = n.tg && state.talkgroupInfo[String(n.tg)] ? ` — ${escapeHtml(state.talkgroupInfo[String(n.tg)])}` : "";
+  return `
+    <div class="map-popup">
+      <div class="map-popup-head">
+        <span class="map-popup-cs">${escapeHtml(n.callsign)}</span>
+        ${badgeHtml}${talkingHtml}
+      </div>
+      ${n.location ? `<div class="map-popup-loc">${escapeHtml(n.location)}</div>` : ""}
+      ${n.tg ? `<div class="map-popup-tg">TG ${n.tg}${tgLabel}</div>` : ""}
+      ${monitored ? `<div class="map-popup-mt">${escapeHtml(monitored)}</div>` : ""}
+    </div>`;
+}
+
 function renderMap() {
-  // Talker qualification runs even when the map view hasn't been opened
-  // yet — that way, by the time the user switches to the Map tab, the
-  // 1.5 s timers already reflect what's on the air.
+  // Talker qualification must run on every node update regardless of whether
+  // the map is visible — it drives the 1.5 s timers and the camera re-fit.
   updateTalkerQualifications();
   if (!mapState.map || !mapState.markersLayer) return;
-  mapState.markersLayer.clearLayers();
-  const nodes = Array.from(state.reflector.nodes.values()).filter((n) => n.lat != null && n.lon != null);
-  for (const n of nodes) {
+  // Skip the heavy marker work entirely while the Map tab isn't active.
+  // updateTalkerQualifications already ran above so we don't drop the timer
+  // state — only the SVG churn.
+  if (state.activeScreen !== "map") return;
+
+  const wanted = new Set();
+  for (const n of state.reflector.nodes.values()) {
+    if (n.lat == null || n.lon == null) continue;
+    wanted.add(n.callsign);
     const isTalker = !!n.isTalker;
     const color = nodeColor(n);
     const size = isTalker ? 16 : 10;
-    const marker = L.circleMarker([n.lat, n.lon], {
-      radius: size / 2,
-      color,
-      fillColor: color,
-      fillOpacity: isTalker ? 0.95 : 0.85,
-      weight: isTalker ? 2 : 1,
-    });
-    const monitored = n.monitoredTGs?.length ? `Monitors: ${n.monitoredTGs.join(", ")}` : "";
-    const badge = nodeBadge(n);
-    const badgeHtml = `<span class="map-badge" style="background:${badge.bg}">${badge.label}</span>`;
-    const talkingHtml = isTalker ? `<span class="map-badge map-badge-talking">TALKING</span>` : "";
-    const tgLabel = n.tg && state.talkgroupInfo[String(n.tg)] ? ` — ${escapeHtml(state.talkgroupInfo[String(n.tg)])}` : "";
-    const html = `
-      <div class="map-popup">
-        <div class="map-popup-head">
-          <span class="map-popup-cs">${escapeHtml(n.callsign)}</span>
-          ${badgeHtml}${talkingHtml}
-        </div>
-        ${n.location ? `<div class="map-popup-loc">${escapeHtml(n.location)}</div>` : ""}
-        ${n.tg ? `<div class="map-popup-tg">TG ${n.tg}${tgLabel}</div>` : ""}
-        ${monitored ? `<div class="map-popup-mt">${escapeHtml(monitored)}</div>` : ""}
-      </div>`;
-    marker.bindPopup(html);
-    marker.addTo(mapState.markersLayer);
+    const styleSig = color + "|" + size + "|" + (isTalker ? 1 : 0) + "|" + (n.online ? 1 : 0);
+    const popupSig = (n.callsign || "") + "|" + (n.location || "") + "|" + (n.tg || "") + "|" + (n.monitoredTGs?.join(",") || "") + "|" + isTalker;
+    let cached = markerCache.get(n.callsign);
+    if (!cached) {
+      const marker = L.circleMarker([n.lat, n.lon], {
+        radius: size / 2,
+        color, fillColor: color,
+        fillOpacity: isTalker ? 0.95 : 0.85,
+        weight: isTalker ? 2 : 1,
+      });
+      marker.bindPopup(buildPopupHtml(n));
+      marker.addTo(mapState.markersLayer);
+      markerCache.set(n.callsign, { marker, styleSig, popupSig, lat: n.lat, lon: n.lon });
+    } else {
+      if (cached.lat !== n.lat || cached.lon !== n.lon) {
+        cached.marker.setLatLng([n.lat, n.lon]);
+        cached.lat = n.lat; cached.lon = n.lon;
+      }
+      if (cached.styleSig !== styleSig) {
+        cached.marker.setStyle({
+          radius: size / 2,
+          color, fillColor: color,
+          fillOpacity: isTalker ? 0.95 : 0.85,
+          weight: isTalker ? 2 : 1,
+        });
+        cached.styleSig = styleSig;
+      }
+      if (cached.popupSig !== popupSig) {
+        // setPopupContent updates without closing an open popup.
+        cached.marker.setPopupContent(buildPopupHtml(n));
+        cached.popupSig = popupSig;
+      }
+    }
+  }
+  // Drop markers whose nodes vanished from the feed.
+  for (const [cs, cached] of markerCache) {
+    if (!wanted.has(cs)) {
+      try { mapState.markersLayer.removeLayer(cached.marker); } catch (_) {}
+      markerCache.delete(cs);
+    }
   }
   updateHomeMarker();
 }
@@ -1643,16 +1958,28 @@ function initTitleBar() {
   });
 
   // Update pill — main process polls GitHub daily and pushes this event
-  // when a newer release tag is available. Click opens the download page.
+  // when a newer release tag is available. Click opens the download page;
+  // pill flips to a muted "Opened" state so the user gets feedback.
   const updateBtn = document.getElementById("btn-update");
   const updateLabel = document.getElementById("update-pill-label");
-  window.api.onUpdateAvailable?.((info) => {
-    if (!updateBtn) return;
+  const showUpdate = (info) => {
+    if (!updateBtn || !info) return;
     if (updateLabel) updateLabel.textContent = `v${info.version} available`;
     updateBtn.title = `New version ${info.version} — click to open ${info.url || "the download page"}`;
     updateBtn.style.display = "";
+    updateBtn.classList.remove("opened");
+  };
+  window.api.onUpdateAvailable?.(showUpdate);
+  // Pull on bootstrap in case the broadcast was delivered before this
+  // handler registered — race-free path.
+  window.api.checkUpdateNow?.().then((info) => { if (info) showUpdate(info); }).catch(() => {});
+  updateBtn?.addEventListener("click", () => {
+    window.api.openUpdateUrl?.();
+    // Visual ack — pill muted with a tick so the user knows the click landed.
+    if (updateLabel) updateLabel.textContent = "Opened ↗";
+    updateBtn.classList.add("opened");
+    updateBtn.title = "Opened in your browser";
   });
-  updateBtn?.addEventListener("click", () => window.api.openUpdateUrl?.());
 }
 
 // ── Settings ──────────────────────────────────────────────────────────────────
@@ -1701,6 +2028,17 @@ function initSettings() {
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────────
+async function bleAutoReconnectOnStartup() {
+  if (!getSavedDeviceId() && !getSavedDeviceName()) return;
+  await bleConnect();
+}
+// Reassign — bleAutoReconnectOnStartup was defined earlier (before the new
+// scanning guard) and the window-bound reference at line ~855 points at the
+// original. Both refer to the same closure body; this re-binding ensures
+// the main process's executeJavaScript("window.bleAutoReconnectOnStartup()")
+// goes through the gated path even if the original got re-exported.
+window.bleAutoReconnectOnStartup = bleAutoReconnectOnStartup;
+
 async function main() {
   // Theme/title/limit are applied via applyConfig() once settings load.
   initTitleBar();
@@ -1715,10 +2053,17 @@ async function main() {
 
   state.history = loadHistory();
 
+  // Send the saved-device-id to main BEFORE the cfg load — otherwise the
+  // chooser handler could race ahead with preferredBleId="" and auto-connect
+  // to whichever HotSpot advertises first (wrong pick in a multi-HS room).
+  // setPreferredBleId is a fire-and-forget ipcRenderer.send so it lands on
+  // main's event loop ahead of the upcoming executeJavaScript that triggers
+  // bleAutoReconnectOnStartup.
+  try { window.api.setPreferredBleId?.(getSavedDeviceId()); } catch {}
+
   const cfg = await window.api.loadSettings();
   applyConfig(cfg);
 
-  try { window.api.setPreferredBleId?.(getSavedDeviceId()); } catch {}
   setBleStatus("Not connected", "");
 
   renderFeed();
@@ -1726,10 +2071,42 @@ async function main() {
   renderInfo();
   renderReflectorScreen();
 
+  // Time-label tick — every second, refresh ONLY the cells whose displayed
+  // text could have changed (the differential renderTable handles this
+  // cheaply now). 1 s is still the right cadence for the "5s/2m/1h" ladder.
   setInterval(() => {
     renderTable();
     if (state.activeScreen === "reflector") renderReflectorScreen();
   }, 1000);
+
+  // Tell main "I'm here, drain anything you queued." Currently only the
+  // update-pill broadcast — see main.js onCachedUpdateAvailable.
+  try { window.api.rendererReady?.(); } catch {}
+
+  // On OS resume, the BLE keepalive timers were almost certainly throttled
+  // to ~1/min so we discover the dead GATT link only minutes later. Kick the
+  // watchdog so we reconnect in <1 s instead.
+  window.api.onPowerResume?.(() => {
+    if (ble.device && !ble.userDisconnected && !ble.scanning && !ble.reconnecting) {
+      scheduleReconnect(500);
+    }
+    // Reflector WSS — same idea; force a reconnect attempt so we don't sit
+    // on a half-open zombie socket waiting for a TCP keepalive to time out.
+    if (state.reflector.domain && state.reflector.enabled) {
+      reflectorScheduleReconnect();
+    }
+  });
+
+  // before-quit / beforeunload — flush WSS + BLE so the OS doesn't see a
+  // half-closed peer. Mostly cosmetic but it gets us out of "stuck pairing"
+  // states on macOS sometimes.
+  const teardown = () => {
+    try { reflectorReset(); } catch (_) {}
+    try { if (ble.abort) ble.abort.abort(); } catch (_) {}
+    try { if (ble.device?.gatt?.connected) ble.device.gatt.disconnect(); } catch (_) {}
+  };
+  window.api.onBeforeQuit?.(teardown);
+  window.addEventListener("beforeunload", teardown);
 }
 
 main().catch((err) => {

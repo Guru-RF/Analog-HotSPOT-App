@@ -1,27 +1,46 @@
 name: Build & Release
 
-# Push a tag like v1.0.0 to trigger a full release build.
+# Push a tag like v1.0.0 to trigger a full release build. workflow_dispatch
+# lets an operator re-run on an existing tag (no destructive tag re-push).
 on:
   push:
     tags:
       - 'v*.*.*'
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Existing tag to (re-)build, e.g. v1.0.9
+        required: true
+        type: string
+
+# Only one release pipeline runs at a time per tag — protects against two
+# near-simultaneous tag pushes racing on notarytool submissions / release
+# asset uploads.
+concurrency:
+  group: release-${{ github.ref_name || inputs.tag }}
+  cancel-in-progress: false
 
 permissions:
   contents: write
 
 jobs:
-  # ── Stage 1: create the GitHub Release with release notes ──────────────────
+  # ── Stage 1: create the GitHub Release as a DRAFT ────────────────────────
+  # Was published immediately, which meant v1.0.7's update-notifier could
+  # point users at a release whose macOS DMGs hadn't even been built yet.
+  # We now create draft + promote on success in stage 3.
   create-release:
-    name: Create Release
+    name: Create draft release
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-
-      - name: Create GitHub Release
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Create GitHub Release (draft)
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           body_path: RELEASE_NOTES.md
-          draft: false
+          draft: true
           prerelease: false
 
   # ── Stage 2: build each platform and upload artifacts ─────────────────────
@@ -50,6 +69,8 @@ jobs:
 
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
 
       - uses: actions/setup-node@v4
         with:
@@ -60,9 +81,6 @@ jobs:
         run: npm ci
 
       # macOS: import the Developer ID cert into an ephemeral keychain.
-      # apple-actions/import-codesign-certs handles Keychain-Access legacy p12s,
-      # ephemeral keychain creation, partition-list wiring, and cleanup on
-      # post-job — all the fiddly bits we were hand-rolling.
       - name: Import Developer ID certificate
         if: matrix.os == 'macos-latest'
         uses: apple-actions/import-codesign-certs@v3
@@ -71,11 +89,6 @@ jobs:
           p12-password: ${{ secrets.MAC_CERTIFICATE_PASSWORD }}
           keychain-password: github-runner-ephemeral
 
-      # The default partition-list `apple-tool:,apple:` is missing `codesign:`,
-      # which the v1.0.6 attempt was bitten by: signing hung for an hour with
-      # no log output because every codesign invocation was waiting on a
-      # never-arriving Keychain Access prompt. Forcing the entry plus a long
-      # unlock prevents that on ephemeral CI keychains.
       - name: Grant unattended codesign access to private key
         if: matrix.os == 'macos-latest'
         run: |
@@ -89,16 +102,22 @@ jobs:
 
       - name: Verify codesigning identity
         if: matrix.os == 'macos-latest'
-        run: security find-identity -v -p codesigning
+        run: |
+          set -e
+          security find-identity -v -p codesigning
+          # Fail fast if no Developer ID Application identity made it into
+          # the ephemeral keychain — saves us 90 min of notarize attempts.
+          count=$(security find-identity -v -p codesigning | grep -c "Developer ID Application" || true)
+          if [ "$count" -lt 1 ]; then
+            echo "::error::No Developer ID Application identity found in keychain"
+            exit 1
+          fi
 
-      # Pre-flight: hit Apple's notary service with the SAME credentials
-      # `notarytool submit` will use, but a cheap call that returns in a few
-      # seconds. Three outcomes tell us where the previous hang lives:
-      #  - returns history → credentials and network are fine, hang is the
-      #    upload itself or an electron-builder issue
-      #  - "Authentication failed" → APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD /
-      #    APPLE_TEAM_ID is wrong (most likely the app-specific password)
-      #  - hangs past timeout → DNS / firewall / Apple service issue
+      # Pre-flight: hit Apple's notary service with the credentials notarytool
+      # submit will use. Fail-stop the WHOLE job on non-zero exit so a wrong
+      # APPLE_APP_SPECIFIC_PASSWORD doesn't waste 105 min before we discover
+      # it. The previous version used `head -30` in a pipe, which made
+      # PIPESTATUS[0] just echoed instead of asserted.
       - name: Pre-flight notarize credentials test
         if: matrix.os == 'macos-latest'
         timeout-minutes: 3
@@ -107,15 +126,21 @@ jobs:
           APPLE_APP_SPECIFIC_PASSWORD: ${{ secrets.APPLE_APP_SPECIFIC_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         run: |
+          set -e
           echo "APPLE_ID length: ${#APPLE_ID}"
           echo "APPLE_TEAM_ID length: ${#APPLE_TEAM_ID}"
           echo "APPLE_APP_SPECIFIC_PASSWORD length: ${#APPLE_APP_SPECIFIC_PASSWORD}"
           echo "Calling notarytool history…"
-          time xcrun notarytool history \
-            --apple-id "$APPLE_ID" \
-            --password "$APPLE_APP_SPECIFIC_PASSWORD" \
-            --team-id "$APPLE_TEAM_ID" 2>&1 | head -30
-          echo "history exit=${PIPESTATUS[0]}"
+          if ! xcrun notarytool history \
+              --apple-id "$APPLE_ID" \
+              --password "$APPLE_APP_SPECIFIC_PASSWORD" \
+              --team-id "$APPLE_TEAM_ID" > /tmp/notarytool-history.log 2>&1; then
+            rc=$?
+            echo "::error::notarytool history failed (exit $rc) — check APPLE_ID / APPLE_APP_SPECIFIC_PASSWORD / APPLE_TEAM_ID"
+            head -40 /tmp/notarytool-history.log
+            exit $rc
+          fi
+          head -30 /tmp/notarytool-history.log
 
       - name: Build macOS (signed only — notarize comes after)
         if: matrix.os == 'macos-latest'
@@ -126,21 +151,16 @@ jobs:
         timeout-minutes: 15
         run: npm run ${{ matrix.script }} -- --publish never
 
-      # electron-builder's notarize wait was hanging up to an hour even
-      # though `notarytool history` confirmed our submissions reached
-      # status:Accepted on Apple's side within a few minutes. Drive
-      # notarytool ourselves so we see every progress line and have a
-      # tight, predictable timeout.
+      # electron-builder's notarize wait was hanging up to an hour even though
+      # `notarytool history` confirmed our submissions reached status:Accepted
+      # on Apple's side within a few minutes. Drive notarytool ourselves so we
+      # see every progress line and have a tight, predictable timeout. The
+      # step is allowed to fail (continue-on-error) so we still upload a
+      # signed-but-un-stapled DMG if Apple's queue exceeds the 90-min budget;
+      # stage 3 won't promote the draft to public if any required artifact is
+      # missing, so users on auto-update are never sent to a broken release.
       - name: Notarize and staple DMGs (parallel notarytool)
         if: matrix.os == 'macos-latest'
-        # Apple's queue is sticking at 55–70 min per submission for our
-        # brand-new team. Even parallel submissions don't always finish
-        # together — v1.0.7's Intel cleared at 56 min while AppleSilicon
-        # was still pending at 60 min. 90 min covers the observed worst
-        # case; continue-on-error guarantees the upload step still runs
-        # even if a submission misses the window (we'll ship un-stapled,
-        # which still works via Gatekeeper's online check). The team
-        # builds reputation each clear, so this slack tightens over time.
         timeout-minutes: 90
         continue-on-error: true
         env:
@@ -152,7 +172,7 @@ jobs:
           shopt -s nullglob
           DMGS=(dist/*.dmg)
           if [ ${#DMGS[@]} -eq 0 ]; then
-            echo "No DMGs found in dist/ — nothing to notarize." >&2
+            echo "::error::No DMGs found in dist/ — nothing to notarize."
             exit 1
           fi
           notarize_one() {
@@ -168,14 +188,11 @@ jobs:
             xcrun stapler staple "$dmg" 2>&1 | sed "s|^|$tag |"
             xcrun stapler validate "$dmg" 2>&1 | sed "s|^|$tag |"
           }
-          # Kick off both submissions in parallel; Apple processes them on
-          # independent slots, so we're only waiting once for the slowest.
           pids=()
           for dmg in "${DMGS[@]}"; do
             notarize_one "$dmg" &
             pids+=($!)
           done
-          # Fail the step if any background notarize fails.
           status=0
           for pid in "${pids[@]}"; do
             wait "$pid" || status=$?
@@ -186,7 +203,30 @@ jobs:
         if: matrix.os != 'macos-latest'
         run: npm run ${{ matrix.script }} -- --publish never
 
-      - name: Upload artifacts to release
+      - name: Upload artifacts to draft release
         uses: softprops/action-gh-release@v2
         with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
           files: ${{ matrix.artifacts }}
+          draft: true
+
+  # ── Stage 3: flip the draft to a public release ──────────────────────────
+  # Only runs after every matrix leg succeeded; if any platform build failed
+  # the draft stays a draft and the update notifier keeps pointing users at
+  # the previous good release.
+  promote-release:
+    name: Promote draft to public release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.tag || github.ref }}
+      - name: Promote release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ inputs.tag || github.ref_name }}
+          body_path: RELEASE_NOTES.md
+          draft: false
+          prerelease: false
+          make_latest: true

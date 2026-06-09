@@ -1,14 +1,39 @@
-const { app, BrowserWindow, ipcMain, Menu, Tray, nativeImage, shell } = require("electron");
+const { app, BrowserWindow, ipcMain, Menu, Tray, Notification, nativeImage, powerMonitor, shell } = require("electron");
 const path = require("path");
 const fs = require("fs");
 
 // Force the menu-bar / About / Quit labels to "HotSpot" regardless of the npm
 // package `name`. Must run before app.whenReady().
 app.setName("HotSpot");
+// Without this Windows toasts attribute to "Electron", taskbar pinning breaks
+// across upgrades, and grouping is wrong. macOS/Linux ignore.
+if (process.platform === "win32") {
+  app.setAppUserModelId("com.gururf.hotspot-app");
+}
+
+// Single-instance lock — prevents a second double-click of the Dock/Taskbar
+// icon during slow first launch from racing against the original on the
+// settings.json write and the BLE peripheral lock.
+const gotTheLock = app.requestSingleInstanceLock();
+if (!gotTheLock) {
+  app.quit();
+} else {
+  app.on("second-instance", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+  });
+}
 
 let mainWindow;
 let settingsWindow = null;
+let creatingSettingsWindow = false; // lock guarding rapid gear-click race
 let tray = null;
+// True once `before-quit` fires — distinguishes "user pressed Cmd+Q / quit
+// from tray" from "user clicked the red close circle" so the close handler
+// can hide-instead-of-close on macOS without trapping a real quit.
+let isQuitting = false;
 // Stable platform BLE identifier (Electron's `deviceId`) for the last hotspot
 // the user connected to. Survives firmware re-flashes that change the
 // advertised name. Empty = no saved preference, the user gets the picker.
@@ -105,22 +130,126 @@ const DEFAULT_SETTINGS = {
   homeRadiusKm: 150,
 };
 
-function loadSettings() {
+// `fs.writeFileSync` is NOT atomic — a crash mid-write leaves a half-written
+// JSON file that fails to parse on next launch, silently falling back to
+// defaults and wiping the user's entire configuration. POSIX `rename` IS
+// atomic; on Windows `fs.renameSync` calls ReplaceFileW which is atomic
+// enough for our needs.
+function atomicWriteFileSync(target, data) {
+  const tmp = target + ".tmp-" + process.pid + "-" + Date.now();
+  fs.writeFileSync(tmp, data);
   try {
-    const p = getSettingsPath();
-    if (fs.existsSync(p)) {
-      const saved = JSON.parse(fs.readFileSync(p, "utf-8"));
-      // Treat empty objects as "not set" so defaults are used instead
+    fs.renameSync(tmp, target);
+  } catch (e) {
+    // Cleanup the tmp file before re-throwing so we don't litter userData.
+    try { fs.unlinkSync(tmp); } catch (_) {}
+    throw e;
+  }
+}
+
+function loadSettings() {
+  const p = getSettingsPath();
+  let raw = null;
+  try {
+    if (fs.existsSync(p)) raw = fs.readFileSync(p, "utf-8");
+  } catch (e) {
+    console.warn("[settings] read failed:", e && e.message);
+  }
+  if (!raw) {
+    // Try the previous-good backup before giving up.
+    try {
+      const bak = p + ".bak";
+      if (fs.existsSync(bak)) raw = fs.readFileSync(bak, "utf-8");
+    } catch (_) {}
+  }
+  if (raw) {
+    try {
+      const saved = JSON.parse(raw);
       if (!saved.talkgroupInfo || !Object.keys(saved.talkgroupInfo).length)
         delete saved.talkgroupInfo;
       return { ...DEFAULT_SETTINGS, ...saved };
+    } catch (e) {
+      // Quarantine the corrupt file so the user can recover their talkgroups
+      // list (and we have something to inspect during support). Do NOT
+      // overwrite an existing quarantine.
+      try {
+        const q = p + ".corrupt-" + Date.now();
+        if (fs.existsSync(p)) fs.copyFileSync(p, q);
+        console.error("[settings] parse failed; quarantined to", q, e && e.message);
+      } catch (qe) {
+        console.error("[settings] parse failed AND quarantine failed:", e && e.message, qe && qe.message);
+      }
     }
-  } catch (_) {}
+  }
   return { ...DEFAULT_SETTINGS };
 }
 
 function saveSettings(settings) {
-  fs.writeFileSync(getSettingsPath(), JSON.stringify(settings, null, 2));
+  const target = getSettingsPath();
+  const bak = target + ".bak";
+  // Roll the previous good file aside before writing the new one. After the
+  // rename the .bak still exists for crash recovery in loadSettings.
+  try {
+    if (fs.existsSync(target)) fs.copyFileSync(target, bak);
+  } catch (_) {}
+  atomicWriteFileSync(target, JSON.stringify(settings, null, 2));
+}
+
+// Allowlist + type/length checks for the settings:save IPC. Any field not
+// listed here gets dropped; anything failing its check falls back to the
+// existing saved value so a hostile/corrupted renderer can't poison disk.
+// `caps` defends against unbounded talkgroups list / multi-MB strings.
+const REFLECTOR_DOMAIN_RE = /^[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)+$/i;
+function validateSettingsPartial(partial) {
+  if (!partial || typeof partial !== "object" || Array.isArray(partial)) return {};
+  const out = {};
+  const setStr = (k, max) => {
+    const v = partial[k];
+    if (typeof v === "string" && v.length <= max) out[k] = v;
+  };
+  const setBool = (k) => { if (typeof partial[k] === "boolean") out[k] = partial[k]; };
+  const setNumOrNull = (k, min, max) => {
+    const v = partial[k];
+    if (v === null) { out[k] = null; return; }
+    if (typeof v === "number" && Number.isFinite(v) && v >= min && v <= max) out[k] = v;
+  };
+  setStr("title", 64);
+  setBool("alwaysOnTop");
+  if (partial.theme === "dark" || partial.theme === "light") out.theme = partial.theme;
+  setNumOrNull("historyLimit", 1, 1000);
+  if (partial.talkgroupInfo && typeof partial.talkgroupInfo === "object" && !Array.isArray(partial.talkgroupInfo)) {
+    const tg = {};
+    const keys = Object.keys(partial.talkgroupInfo).slice(0, 500);
+    for (const k of keys) {
+      const key = String(k).trim().slice(0, 32);
+      const val = String(partial.talkgroupInfo[k] ?? "").slice(0, 128);
+      if (key) tg[key] = val;
+    }
+    out.talkgroupInfo = tg;
+  }
+  // Reflector domain — must look like a hostname (no schemes, no path, no @).
+  if (typeof partial.reflectorDomain === "string") {
+    const d = partial.reflectorDomain.trim().toLowerCase();
+    if (d === "" || REFLECTOR_DOMAIN_RE.test(d.replace(/^reflector\./, "").replace(/^portal\./, ""))) {
+      out.reflectorDomain = d;
+    }
+  }
+  setBool("wssEnabled");
+  setBool("tgAutoUpdate");
+  setStr("tgUpdateUrl", 512);
+  setStr("homeStreet",  128);
+  setStr("homeNumber",  32);
+  setStr("homeZip",     32);
+  setStr("homeCity",    128);
+  setStr("homeCountry", 64);
+  setNumOrNull("homeLat", -90, 90);
+  setNumOrNull("homeLng", -180, 180);
+  setNumOrNull("homeRadiusKm", 1, 5000);
+  // Window-bounds passthrough (we wrote it ourselves, so trust shape).
+  if (partial.settingsWindowBounds && typeof partial.settingsWindowBounds === "object") {
+    out.settingsWindowBounds = partial.settingsWindowBounds;
+  }
+  return out;
 }
 
 function createWindow() {
@@ -142,6 +271,9 @@ function createWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
 
@@ -152,8 +284,9 @@ function createWindow() {
     mainWindow.webContents.openDevTools({ mode: "detach" });
   }
 
-  // Kick off silent BLE auto-reconnect after the renderer is ready.
-  // executeJavaScript with userGesture=true lets requestDevice() run without a click.
+  // Renderer-driven update-pill broadcast happens AFTER did-finish-load; until
+  // then we cache any update available so a late-bound listener still picks
+  // it up. See ipcMain.handle("renderer:ready") below.
   mainWindow.webContents.once("did-finish-load", () => {
     mainWindow.webContents.executeJavaScript(
       "typeof window.bleAutoReconnectOnStartup === 'function' && window.bleAutoReconnectOnStartup();",
@@ -161,11 +294,57 @@ function createWindow() {
     ).catch(() => {});
   });
 
+  // Renderer-driven external links: footer / info copy / etc. The setName
+  // check rejects any non-https URL outright (no javascript:, no file:, no
+  // mixed-content http). Domain allowlist defends against an injected script
+  // opening a credential-phishing site.
+  const EXTERNAL_ALLOWLIST = [
+    /^https:\/\/(www\.)?qrz\.com(\/|$)/,
+    /^https:\/\/(www\.)?rf\.guru(\/|$)/,
+    /^https:\/\/svxlink-hotspot\.app(\/|$)/,
+    /^https:\/\/github\.com\/Guru-RF\//,
+  ];
   mainWindow.webContents.setWindowOpenHandler(({ url }) => {
-    if (url.startsWith("http://") || url.startsWith("https://")) {
-      shell.openExternal(url);
+    if (EXTERNAL_ALLOWLIST.some((re) => re.test(url))) {
+      shell.openExternal(url).catch(() => {});
+    } else {
+      console.warn("[window-open] blocked", url);
     }
     return { action: "deny" };
+  });
+
+  // Belt-and-braces: refuse in-renderer navigation away from index.html.
+  mainWindow.webContents.on("will-navigate", (e, url) => {
+    if (!url.startsWith("file://")) e.preventDefault();
+  });
+
+  // Frameless windows on Win/Linux give the user no Maximize affordance.
+  // Double-clicking the title bar drag region toggles maximize, matching the
+  // native expectation.
+  ipcMain.on("window:toggle-maximize", () => {
+    if (!mainWindow || mainWindow.isDestroyed()) return;
+    if (mainWindow.isMaximized()) mainWindow.unmaximize();
+    else mainWindow.maximize();
+  });
+
+  // Surface renderer/GPU crashes instead of leaving a white window forever.
+  mainWindow.webContents.on("render-process-gone", (_e, details) => {
+    console.error("[renderer crashed]", details);
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      // Reload once; if it crashes again the user will see the same dialog
+      // and can quit manually.
+      mainWindow.webContents.reload();
+    }
+  });
+
+  // Hide on close (macOS dock-style) so a misclick on the close button doesn't
+  // also tear down BLE + WSS. window-all-closed handler quits on Win/Linux but
+  // skips on darwin (handled below) so the tray + cmd-tab still work.
+  mainWindow.on("close", (e) => {
+    if (!isQuitting && process.platform === "darwin") {
+      e.preventDefault();
+      mainWindow.hide();
+    }
   });
 
   // Web Bluetooth picker — mirrors the Flutter mobile app's
@@ -203,15 +382,20 @@ function createWindow() {
     }
   });
 
+  // Only the bundled file:// renderer should be able to use any of these
+  // privileged APIs. A future XSS in a remote iframe can't request them.
+  const isOurOrigin = (wc) => {
+    try { return (wc && wc.getURL() || "").startsWith("file://"); } catch { return false; }
+  };
   mainWindow.webContents.session.setDevicePermissionHandler((details) => {
     return details.deviceType === "bluetooth";
   });
-  mainWindow.webContents.session.setPermissionCheckHandler((_wc, permission) => {
+  mainWindow.webContents.session.setPermissionCheckHandler((wc, permission) => {
+    if (!isOurOrigin(wc)) return false;
     return ["bluetooth", "bluetooth-devices", "geolocation", "clipboard-sanitized-write"].includes(permission);
   });
-  // Auto-grant geolocation requests (the Map screen uses navigator.geolocation
-  // to seed Home QTH). Electron's default handler denies without prompting.
-  mainWindow.webContents.session.setPermissionRequestHandler((_wc, permission, callback) => {
+  mainWindow.webContents.session.setPermissionRequestHandler((wc, permission, callback) => {
+    if (!isOurOrigin(wc)) return callback(false);
     if (permission === "geolocation" || permission === "clipboard-sanitized-write") {
       return callback(true);
     }
@@ -237,17 +421,19 @@ function clampBoundsToDisplay(bounds, defaults) {
   }
   const display = screen.getDisplayMatching({ x: bounds.x, y: bounds.y, width: w, height: h });
   const wa = display.workArea;
-  // Pull at least 32px into the work area so the titlebar is always grabbable.
+  // Shrink FIRST so the visibility math below has the real dimensions to
+  // clamp against. With the prior order, w/h were used at full saved size
+  // even when the chosen display was smaller.
+  const cw = Math.min(w, wa.width);
+  const ch = Math.min(h, wa.height);
+  // Pull at least 32 px into the work area so the title bar stays grabbable.
   const minVisible = 32;
   let x = bounds.x;
   let y = bounds.y;
-  if (x + w < wa.x + minVisible) x = wa.x;
-  if (y + minVisible > wa.y + wa.height) y = wa.y;
-  if (x > wa.x + wa.width - minVisible) x = wa.x + wa.width - w;
+  if (x + cw < wa.x + minVisible) x = wa.x;
+  if (x > wa.x + wa.width - minVisible) x = wa.x + wa.width - cw;
   if (y < wa.y) y = wa.y;
-  // Shrink if larger than the chosen display.
-  const cw = Math.min(w, wa.width);
-  const ch = Math.min(h, wa.height);
+  if (y > wa.y + wa.height - minVisible) y = wa.y + wa.height - ch;
   return { x: Math.round(x), y: Math.round(y), width: cw, height: ch };
 }
 
@@ -260,46 +446,79 @@ const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_RELEASES_URL = "https://api.github.com/repos/Guru-RF/Analog-HotSPOT-App/releases/latest";
 const UPDATE_LANDING_URL = "https://svxlink-hotspot.app";
 
+// Parses a semver-shaped string into [major, minor, patch, preRank].
+// preRank is 1 for stable releases and 0 for prerelease tags ("1.0.8-beta"),
+// so a stable release is always considered greater than its own prereleases.
+// Returns null for unparseable input — we then refuse to compare.
+function parseVersion(s) {
+  const m = String(s || "").trim().replace(/^v/i, "")
+    .match(/^(\d+)\.(\d+)\.(\d+)(?:\.(\d+))?(?:-(.+))?$/);
+  if (!m) return null;
+  return [Number(m[1]), Number(m[2]), Number(m[3]), Number(m[4] || 0), m[5] ? 0 : 1];
+}
 function isNewerVersion(remote, local) {
-  const pa = String(remote).split(".").map((n) => Number(n) || 0);
-  const pb = String(local).split(".").map((n) => Number(n) || 0);
-  const len = Math.max(pa.length, pb.length);
-  for (let i = 0; i < len; i++) {
-    const a = pa[i] || 0;
-    const b = pb[i] || 0;
-    if (a !== b) return a > b;
+  const a = parseVersion(remote);
+  const b = parseVersion(local);
+  if (!a || !b) return false;
+  for (let i = 0; i < a.length; i++) {
+    if (a[i] !== b[i]) return a[i] > b[i];
   }
   return false;
 }
 
+// Last update info we successfully detected, so a renderer that registers
+// its listener LATE (or reloads) still picks up the pill. Cleared once the
+// renderer signals readiness and we re-send.
+let cachedUpdateAvailable = null;
+
 async function checkForUpdates() {
+  let res;
+  const ac = new AbortController();
+  const tmo = setTimeout(() => ac.abort(), 15000);
   try {
-    const res = await fetch(UPDATE_RELEASES_URL, {
+    res = await fetch(UPDATE_RELEASES_URL, {
       headers: {
         "User-Agent": "HotSpot-Desktop-App",
         "Accept": "application/vnd.github+json",
       },
+      signal: ac.signal,
     });
-    if (!res.ok) return;
-    const json = await res.json();
-    const latest = String(json.tag_name || "").replace(/^v/, "").trim();
-    if (!latest) return;
-    const current = app.getVersion();
-    if (!isNewerVersion(latest, current)) return;
-    if (mainWindow && !mainWindow.isDestroyed()) {
-      mainWindow.webContents.send("update:available", {
-        version: latest,
-        url: UPDATE_LANDING_URL,
-      });
+  } catch (_) {
+    clearTimeout(tmo);
+    return;
+  }
+  clearTimeout(tmo);
+  if (!res.ok) {
+    // Respect GitHub's primary rate-limit when offered.
+    if (res.status === 403 || res.status === 429) {
+      const reset = Number(res.headers.get("x-ratelimit-reset"));
+      if (Number.isFinite(reset) && reset * 1000 > Date.now()) {
+        console.warn("[update] GitHub rate-limited; retry after", new Date(reset * 1000).toISOString());
+      }
     }
-  } catch (_) {}
+    return;
+  }
+  let json;
+  try { json = await res.json(); } catch (_) { return; }
+  const latest = String(json.tag_name || "").replace(/^v/i, "").trim();
+  if (!latest) return;
+  const current = app.getVersion();
+  if (!isNewerVersion(latest, current)) return;
+  const payload = { version: latest, url: UPDATE_LANDING_URL };
+  cachedUpdateAvailable = payload;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("update:available", payload);
+  }
 }
 
 function startUpdateChecking() {
-  // Slight delay so the renderer's IPC listener is registered before the
-  // first broadcast fires.
+  // Slight delay so the renderer's listener is up. The renderer also calls
+  // ipcMain.handle("update:check-now") on ready so the timing is
+  // race-resilient regardless of disk/CPU load.
   setTimeout(checkForUpdates, 5000);
-  setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS);
+  // Add 0–30 min jitter so coordinated launches (corporate machine pool, dev
+  // restarts) don't all hit api.github.com at the same wall-clock minute.
+  setInterval(checkForUpdates, UPDATE_CHECK_INTERVAL_MS + Math.floor(Math.random() * 30 * 60 * 1000));
 }
 
 function createSettingsWindow() {
@@ -315,6 +534,11 @@ function createSettingsWindow() {
     settingsWindow.focus();
     return;
   }
+  // Two near-simultaneous gear-clicks both pass the !isDestroyed check
+  // before either reaches the `new BrowserWindow` below — the lock blocks
+  // the second one until the window actually exists.
+  if (creatingSettingsWindow) return;
+  creatingSettingsWindow = true;
   const defaults = { width: 620, height: 820 };
   const savedCfg = loadSettings();
   const bounds = clampBoundsToDisplay(savedCfg.settingsWindowBounds, defaults);
@@ -336,22 +560,49 @@ function createSettingsWindow() {
       preload: path.join(__dirname, "preload.js"),
       contextIsolation: true,
       nodeIntegration: false,
+      sandbox: true,
+      webSecurity: true,
+      allowRunningInsecureContent: false,
     },
   });
+  creatingSettingsWindow = false;
   settingsWindow.setMenuBarVisibility(false);
   settingsWindow.loadFile(path.join(__dirname, "renderer", "settings.html"));
 
-  // Persist bounds so we can clamp + restore next time.
+  // Persist bounds — debounced 500 ms trailing so a drag burst (dozens of
+  // events/sec) doesn't write the settings.json over and over. Sync disk I/O
+  // on every event also blocked every other IPC handler.
+  let persistTimer = null;
+  let lastSerializedBounds = "";
   const persistBounds = () => {
     if (!settingsWindow || settingsWindow.isDestroyed()) return;
-    try {
-      const b = settingsWindow.getBounds();
-      const current = loadSettings();
-      saveSettings({ ...current, settingsWindowBounds: b });
-    } catch (_) {}
+    let b;
+    try { b = settingsWindow.getBounds(); } catch { return; }
+    const sig = b.x + "," + b.y + "," + b.width + "," + b.height;
+    if (sig === lastSerializedBounds) return;
+    lastSerializedBounds = sig;
+    if (persistTimer) clearTimeout(persistTimer);
+    persistTimer = setTimeout(() => {
+      persistTimer = null;
+      try {
+        const current = loadSettings();
+        saveSettings({ ...current, settingsWindowBounds: b });
+      } catch (_) {}
+    }, 500);
   };
   settingsWindow.on("move",   persistBounds);
   settingsWindow.on("resize", persistBounds);
+  // Final flush on close — the trailing-edge timer might be pending.
+  settingsWindow.on("close", () => {
+    if (persistTimer) { clearTimeout(persistTimer); persistTimer = null; }
+    if (settingsWindow && !settingsWindow.isDestroyed()) {
+      try {
+        const b = settingsWindow.getBounds();
+        const current = loadSettings();
+        saveSettings({ ...current, settingsWindowBounds: b });
+      } catch (_) {}
+    }
+  });
   settingsWindow.on("closed", () => { settingsWindow = null; });
 
   if (!app.isPackaged) settingsWindow.webContents.openDevTools({ mode: "detach" });
@@ -365,6 +616,11 @@ function createTray() {
     const icon = nativeImage.createFromBuffer(iconData, {
       width: 16, height: 16, scaleFactor: 2.0,
     });
+    if (process.platform === "darwin") {
+      // Template image = pure black with alpha; macOS auto-inverts for dark
+      // menu bar. Without this the icon is stuck at one tone in either theme.
+      icon.setTemplateImage(true);
+    }
     tray = new Tray(icon);
     tray.setToolTip("HotSpot — not connected");
     rebuildTrayMenu({ connected: false });
@@ -389,9 +645,36 @@ app.whenReady().then(() => {
       if (!dockIcon.isEmpty()) app.dock.setIcon(dockIcon);
     } catch (_) {}
   }
+  buildApplicationMenu();
   createWindow();
   createTray();
   startUpdateChecking();
+
+  // After OS sleep/wake, BLE keepalive timers may have been throttled to
+  // ~1/min and the GATT link is often silently dead. Forcing a reconnect
+  // tick on resume gets us back faster than the next watchdog cycle.
+  powerMonitor.on("resume", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("power:resume");
+    }
+  });
+  powerMonitor.on("suspend", () => {
+    if (mainWindow && !mainWindow.isDestroyed()) {
+      mainWindow.webContents.send("power:suspend");
+    }
+  });
+});
+
+// Dock click on macOS → reopen the hidden window. window-all-closed never
+// fires here because we hide-instead-of-close.
+app.on("activate", () => {
+  if (process.platform !== "darwin") return;
+  if (BrowserWindow.getAllWindows().length === 0) {
+    createWindow();
+  } else if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.show();
+    mainWindow.focus();
+  }
 });
 
 // Renderer asks us to open the landing page when the user clicks the
@@ -401,16 +684,95 @@ ipcMain.on("update:open", () => {
   shell.openExternal(UPDATE_LANDING_URL).catch(() => {});
 });
 
-app.on("window-all-closed", () => {
-  app.quit();
+// Renderer-pull alternative to the broadcast above — fixes the race where
+// the renderer's listener wasn't yet registered when the first checkForUpdates
+// fired. The renderer calls this AFTER its onUpdateAvailable handler is up.
+ipcMain.handle("update:check-now", async () => {
+  if (cachedUpdateAvailable) return cachedUpdateAvailable;
+  await checkForUpdates();
+  return cachedUpdateAvailable;
 });
+
+// "I'm ready, replay anything that was waiting." Used by the renderer to
+// drain late-arriving boot-time broadcasts (update pill, etc.).
+ipcMain.on("renderer:ready", (e) => {
+  if (cachedUpdateAvailable && e.sender) {
+    e.sender.send("update:available", cachedUpdateAvailable);
+  }
+});
+
+app.on("before-quit", () => {
+  isQuitting = true;
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    // Give the renderer a chance to close WSS + BLE cleanly before main exits.
+    mainWindow.webContents.send("app:before-quit");
+  }
+});
+
+app.on("window-all-closed", () => {
+  // On macOS the convention is to leave the app running in the dock/tray
+  // until the user explicitly Cmd+Q's; everywhere else, close = quit.
+  if (process.platform !== "darwin") app.quit();
+});
+
+// Application menu — until now we suppressed the menu bar entirely on
+// Win/Linux, which also killed Cmd+,/Ctrl+, → Settings and Cmd+R → Reload
+// (dev). Build a small, platform-aware menu so the standard accelerators
+// fire even when setMenuBarVisibility(false) hides the bar.
+function buildApplicationMenu() {
+  const isMac = process.platform === "darwin";
+  const macApp = isMac ? [{
+    label: "HotSpot",
+    submenu: [
+      { role: "about" },
+      { type: "separator" },
+      { label: "Settings…", accelerator: "Cmd+,", click: () => createSettingsWindow() },
+      { type: "separator" },
+      { role: "hide" }, { role: "hideOthers" }, { role: "unhide" },
+      { type: "separator" },
+      { role: "quit" },
+    ],
+  }] : [];
+  const file = {
+    label: "File",
+    submenu: isMac ? [{ role: "close" }] : [
+      { label: "Settings…", accelerator: "Ctrl+,", click: () => createSettingsWindow() },
+      { type: "separator" },
+      { role: "quit" },
+    ],
+  };
+  const view = {
+    label: "View",
+    submenu: [
+      { role: "reload" }, { role: "forceReload" }, { role: "toggleDevTools" },
+      { type: "separator" },
+      { role: "resetZoom" }, { role: "zoomIn" }, { role: "zoomOut" },
+    ],
+  };
+  const win = {
+    label: "Window",
+    submenu: [
+      { role: "minimize" }, { role: "zoom" },
+      ...(isMac ? [{ type: "separator" }, { role: "front" }] : [{ role: "close" }]),
+    ],
+  };
+  Menu.setApplicationMenu(Menu.buildFromTemplate([...macApp, file, view, win]));
+}
 
 ipcMain.handle("settings:load", () => loadSettings());
 ipcMain.handle("settings:defaults", () => ({ ...DEFAULT_SETTINGS }));
 ipcMain.handle("settings:save", (_event, partial) => {
   const current = loadSettings();
-  const updated = { ...current, ...partial };
-  saveSettings(updated);
+  // Allowlist + type/length validation — a hostile or compromised renderer
+  // cannot poison disk or extend the persisted schema.
+  const safe = validateSettingsPartial(partial);
+  const updated = { ...current, ...safe };
+  try {
+    saveSettings(updated);
+  } catch (e) {
+    console.error("[settings] save failed:", e && e.message);
+    return current;
+  }
   // Live-broadcast to the main window so it can re-apply config without a
   // restart. The settings window already has the data it sent up.
   if (mainWindow && !mainWindow.isDestroyed()) {
@@ -428,10 +790,19 @@ ipcMain.on("settings:close-window", (e) => {
 // Forward-geocode a freeform address via OpenStreetMap Nominatim.
 // Lives in the main process so we can set a proper User-Agent (browsers
 // block Renderer-side User-Agent overrides) and respect Nominatim policy.
+// Nominatim's usage policy asks for max 1 req/s and a sensible User-Agent.
+// Cap query length to stop a hostile renderer from sending megabyte-sized
+// queries, and rate-limit to one call per 1500 ms.
+let lastGeoLookupMs = 0;
 ipcMain.handle("geo:lookup", async (_e, query) => {
   if (!query || typeof query !== "string") return null;
   const q = query.trim();
-  if (!q) return null;
+  if (!q || q.length > 200) return null;
+  const now = Date.now();
+  if (now - lastGeoLookupMs < 1500) return null;
+  lastGeoLookupMs = now;
+  const ac = new AbortController();
+  const tmo = setTimeout(() => ac.abort(), 15000);
   try {
     const url = `https://nominatim.openstreetmap.org/search?q=${encodeURIComponent(q)}&format=jsonv2&addressdetails=1&limit=1`;
     const res = await fetch(url, {
@@ -440,6 +811,7 @@ ipcMain.handle("geo:lookup", async (_e, query) => {
         "Accept": "application/json",
         "Accept-Language": "en",
       },
+      signal: ac.signal,
     });
     if (!res.ok) return null;
     const json = await res.json();
@@ -448,18 +820,28 @@ ipcMain.handle("geo:lookup", async (_e, query) => {
     const lat = parseFloat(top.lat);
     const lon = parseFloat(top.lon);
     if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
-    return { lat, lon, displayName: top.display_name || "" };
+    if (lat < -90 || lat > 90 || lon < -180 || lon > 180) return null;
+    return { lat, lon, displayName: String(top.display_name || "").slice(0, 256) };
   } catch (_) {
     return null;
+  } finally {
+    clearTimeout(tmo);
   }
 });
 
 ipcMain.handle("window:toggleOnTop", () => {
   const next = !mainWindow.isAlwaysOnTop();
   mainWindow.setAlwaysOnTop(next);
-  const s = loadSettings();
-  s.alwaysOnTop = next;
-  saveSettings(s);
+  // Route through the same broadcast path the rest of settings uses so the
+  // settings window (if open) sees the new value in real time too.
+  const updated = { ...loadSettings(), alwaysOnTop: next };
+  try { saveSettings(updated); } catch (_) {}
+  if (mainWindow && !mainWindow.isDestroyed()) {
+    mainWindow.webContents.send("settings:changed", updated);
+  }
+  if (settingsWindow && !settingsWindow.isDestroyed()) {
+    settingsWindow.webContents.send("settings:changed", updated);
+  }
   return next;
 });
 ipcMain.handle("window:getOnTop", () => mainWindow.isAlwaysOnTop());
@@ -571,13 +953,17 @@ ipcMain.on("tray:state", (_event, state) => {
           : "HotSpot",
   );
 
-  // Windows toast: only when a *new* talker keys up
-  if (process.platform === "win32" && tk && tk !== prevTalkerText) {
-    tray.displayBalloon({
-      title: "HotSpot",
-      content: `Talking: ${tk}`,
-      iconType: "info",
-    });
+  // Toast on new-talker. tray.displayBalloon is the legacy Win32 balloon
+  // API and is silently dead on Win10/11 in many configurations; the
+  // Notification API drives the proper OS toast pipeline on every platform.
+  if (tk && tk !== prevTalkerText && Notification.isSupported()) {
+    try {
+      new Notification({
+        title: "HotSpot",
+        body: `Talking: ${tk}`,
+        silent: true,
+      }).show();
+    } catch (_) {}
   }
   prevTalkerText = tk || "";
 

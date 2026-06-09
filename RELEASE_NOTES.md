@@ -23,6 +23,82 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.9
+
+A targeted hardening pass after a 10-lens adversarial audit. Most items are invisible if everything was already working — the value is in the failure modes that no longer happen.
+
+### Security / robustness
+
+- Content-Security-Policy meta tag on both renderer windows — any HTML injection now has nowhere to call out to, no remote script to load, no inline `<script>`.
+- IPC inputs are validated against an allowlist (`settings:save` rejects unknown keys, caps every string length, refuses non-hostname reflector domains; `geo:lookup` rate-limits to 1.5 s and caps query length).
+- BLE feed's `rf` field is hostname-validated before being adopted as the reflector domain — a rogue HotSpot-shaped peripheral can no longer pivot your WSS connection.
+- `setWindowOpenHandler` allowlist — external links only open if they match the curated set of HotSpot-related sites.
+- Permission handlers gate on the `file://` origin so a future remote iframe can't request Bluetooth / geolocation.
+- Single-instance lock — a double-Dock-click during slow first launch no longer spawns a second renderer racing for the same BLE peripheral and `settings.json` write.
+
+### Data integrity
+
+- `settings.json` is now written atomically (tmp + rename) with a `.bak` previous-good copy alongside; on parse failure the corrupt file is quarantined under `.corrupt-<ts>` instead of being silently replaced with defaults.
+- Settings-window position is debounced (500 ms trailing) — drag bursts no longer thrash the disk.
+
+### BLE
+
+- `bleConnect` and `bleTryReconnect` now share a monotonic generation counter, so an in-flight reconnect can't clobber `ble.*` after the user manually re-paired to a different hotspot.
+- Characteristic notification listeners are scoped to an `AbortController` per connection cycle, then aborted on reconnect — no more N reconnects → N callbacks per BLE notification leak.
+- Picker's 30 s scan timeout now reliably flips to the "No HotSpots in range — Rescan" empty state regardless of whether late candidates were still being streamed.
+- Picker: full keyboard support (Esc cancels, Tab is trapped, autofocus on open, focus restored to trigger on close, `aria-labelledby`).
+- Forget-while-spinning is no longer silently undone by the in-flight `saveDeviceIdentity`.
+- Saved BLE id is sent to main *before* the BLE chooser fires, so the startup race that could auto-pick the wrong hotspot in a multi-HS room is gone.
+
+### Reflector WSS
+
+- Stale `onclose`/`onerror`/`onmessage` from a previous socket no longer trigger reconnects that race with the fresh one (handler identity check + explicit detach).
+- Snapshot timer is cleared in `reflectorScheduleReconnect` so a transient failure doesn't double-flip `available`.
+- Frames over 4 MB are dropped (defeats a hostile reflector trying to stall the renderer with a megabyte-sized JSON snapshot).
+- Sustained failures back off exponentially up to 5 min — a typo'd domain no longer hammers the upstream every 15 s forever.
+- The renderer's WSS + BLE state is torn down on `beforeunload` / `app:before-quit`.
+
+### Performance
+
+- Map markers are kept in a `Map<callsign, marker>` cache — only the markers whose state actually changed are touched (was ~200 SVG nodes/sec churn during a net; now ≈ 0 between updates).
+- `renderTable` does keyed diff-updates against the existing `<tr>` rows instead of rebuilding the entire `<tbody>.innerHTML` every second. Text selection in the table survives ticks now.
+- Talker-driven `fitBounds` is animation-disabled and debounced 250 ms — no more camera-fighting on the Map tab during a multi-station net.
+- Map markers skip the render entirely while the Map tab isn't visible.
+
+### OS lifecycle
+
+- macOS: window-close hides instead of quitting (matches the standard dock convention). Dock click reopens.
+- `powerMonitor` hooks force a quick BLE + WSS reconnect on system resume — no more sitting for minutes on a half-dead socket after lid-open.
+- `render-process-gone` handler reloads the page once instead of leaving a white window.
+- macOS tray icon is now a template image — adapts to light/dark menu bars.
+
+### Windows / Linux
+
+- `AppUserModelId` set on Windows — toasts attribute to HotSpot instead of "Electron"; taskbar pinning survives upgrades.
+- `tray.displayBalloon` (legacy Win32 API, silently dead on Win10/11 in many configs) replaced with the standard `Notification` API.
+- Application menu added with platform-appropriate accelerators (`Cmd+,` / `Ctrl+,` → Settings, `Cmd+Q` / `Alt+F4` → Quit).
+
+### Update notifier
+
+- Semver-style comparator handles 1.10.0 > 1.9.0, prerelease tags (`1.0.9-beta` < `1.0.9`), and is case-insensitive on the leading `v`.
+- 15 s fetch timeout via `AbortController`; honours GitHub rate-limit headers.
+- New "renderer ready" handshake so the broadcast can't be missed by a slow boot.
+- Pill flips to a muted "Opened ↗" state after click — feedback that the click landed.
+
+### CI / release pipeline
+
+- Releases are created as a **draft**, populated with platform artifacts, and only promoted to public when every leg succeeds. v1.0.7's update notifier will never again point users at a release with missing macOS DMGs.
+- `workflow_dispatch` input — re-run on an existing tag without the destructive `git tag -d` dance.
+- Pre-flight `notarytool history` now exit-fails the job on a wrong app-specific password (was previously swallowed by `head -30`).
+- `concurrency` group prevents two near-simultaneous tag pushes from racing on the notary queue and release-asset upload.
+
+### Accessibility
+
+- Settings window: Esc closes, Cmd/Ctrl+S saves, OS-close prompts on unsaved changes.
+- BLE picker dialog: keyboard navigation, focus management, screen-reader labelling.
+- Light-theme contrast — `--ok`, `--muted`, `--hotspot` darkened for WCAG AA on white.
+- Update pill gains a `:focus-visible` outline and a visible border.
+
 ## What's new in 1.0.8
 
 - **Multi-hotspot picker** (mirrors the Flutter mobile app's `hotspot_picker_sheet`). When more than one HotSpot is in range — or your saved one isn't visible — a modal picker shows the list, sorted with the saved hotspot floated to the top under a green "Last used" chip. Tap to connect, **Rescan** to retry, **Forget** to clear the saved hotspot.

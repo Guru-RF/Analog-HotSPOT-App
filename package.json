@@ -1,7 +1,7 @@
 {
   "name": "hotspot-app",
   "productName": "HotSpot",
-  "version": "1.0.8",
+  "version": "1.0.9",
   "description": "HotSpot — Desktop App for Mac, Windows and Linux (BLE feed viewer)",
   "main": "main.js",
   "scripts": {
@@ -75,6 +75,9 @@
   },
   "author": "RF.Guru",
   "license": "MIT",
+  "engines": {
+    "node": ">=20"
+  },
   "devDependencies": {
     "electron": "^42.3.0",
     "electron-builder": "^25.0.0"
