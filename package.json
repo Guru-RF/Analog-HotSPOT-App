@@ -1,14 +1,15 @@
 {
   "name": "hotspot-app",
   "productName": "HotSpot",
-  "version": "1.0.9",
+  "version": "1.0.10",
   "description": "HotSpot — Desktop App for Mac, Windows and Linux (BLE feed viewer)",
   "main": "main.js",
   "scripts": {
     "start": "electron .",
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
-    "build:win": "electron-builder --win"
+    "build:win": "electron-builder --win nsis --x64 --arm64",
+    "build:win:appx": "electron-builder --win appx --x64 --arm64"
   },
   "build": {
     "appId": "com.gururf.hotspot-app",
@@ -53,10 +54,29 @@
             "x64",
             "arm64"
           ]
+        },
+        {
+          "target": "appx",
+          "arch": [
+            "x64",
+            "arm64"
+          ]
         }
       ],
       "artifactName": "${productName}-Setup-${arch}.${ext}",
       "icon": "build/icon.png"
+    },
+    "appx": {
+      "identityName": "RFGuru.SVXLink-HotSpot",
+      "publisher": "CN=FBF35633-D0C5-410A-883E-75B3C38AB746",
+      "publisherDisplayName": "RF Guru",
+      "applicationId": "HotSpot",
+      "displayName": "SVXLink HotSpot",
+      "backgroundColor": "#0b1220",
+      "languages": [
+        "en-US"
+      ],
+      "artifactName": "${productName}-${arch}.${ext}"
     },
     "linux": {
       "target": [

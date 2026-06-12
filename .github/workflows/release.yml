@@ -60,7 +60,9 @@ jobs:
           - name: Windows
             os: windows-latest
             script: build:win
-            artifacts: dist/*.exe
+            artifacts: |
+              dist/*.exe
+              dist/*.appx
 
           - name: Linux
             os: ubuntu-latest
@@ -202,6 +204,43 @@ jobs:
       - name: Build (unsigned)
         if: matrix.os != 'macos-latest'
         run: npm run ${{ matrix.script }} -- --publish never
+
+      # Microsoft Store / sideload AppX for Windows. Generates a self-signed
+      # cert whose Subject matches the Publisher CN declared in the manifest
+      # (Partner Center → SVXLink-HotSpot identity). The cert is throwaway:
+      # Microsoft re-signs the package during Store certification, so it only
+      # needs to make signtool.exe happy here. Sideload users who install the
+      # .appx directly will have to trust the publisher cert at install time.
+      - name: Generate AppX signing cert (Windows only)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $cert = New-SelfSignedCertificate `
+            -Type Custom `
+            -Subject "CN=FBF35633-D0C5-410A-883E-75B3C38AB746" `
+            -KeyUsage DigitalSignature `
+            -FriendlyName "HotSpot Store Build Cert" `
+            -CertStoreLocation "Cert:\CurrentUser\My" `
+            -TextExtension @("2.5.29.37={text}1.3.6.1.5.5.7.3.3", "2.5.29.19={text}")
+          $pfxPath = Join-Path $env:RUNNER_TEMP "store-cert.pfx"
+          $pwd = ConvertTo-SecureString -String "store-cert-temp" -Force -AsPlainText
+          $cert | Export-PfxCertificate -FilePath $pfxPath -Password $pwd | Out-Null
+          Write-Host "Exported PFX to $pfxPath"
+          "APPX_CERT_PATH=$pfxPath"        | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "APPX_CERT_PASSWORD=store-cert-temp" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: Build Windows AppX (x64 + arm64, signed)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          # WIN_CSC_* are Windows-only signing inputs read by electron-builder.
+          # We re-export inside the shell rather than reading the APPX_CERT_*
+          # vars via a step-level env block: the validator can't statically
+          # confirm a var set by a previous step exists, and we want a clean
+          # actions-lint pass.
+          $env:WIN_CSC_LINK = $env:APPX_CERT_PATH
+          $env:WIN_CSC_KEY_PASSWORD = $env:APPX_CERT_PASSWORD
+          npm run build:win:appx -- --publish never
 
       - name: Upload artifacts to draft release
         uses: softprops/action-gh-release@v2

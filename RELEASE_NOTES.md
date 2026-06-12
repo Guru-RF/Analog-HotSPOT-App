@@ -23,6 +23,12 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.10
+
+- **Microsoft Store packages.** Each release now ships `HotSpot-x64.appx` and `HotSpot-arm64.appx` alongside the NSIS installers. These match the **RFGuru.SVXLink-HotSpot** identity registered in Partner Center and are ready to upload to the Microsoft Store submission flow.
+- AppX manifest declares `runFullTrust` (via electron-builder's Desktop-Bridge template), so the packaged app retains full Web Bluetooth access just like the NSIS installer.
+- Signed in CI with a self-signed cert whose CN matches the registered Publisher (`CN=FBF35633-D0C5-410A-883E-75B3C38AB746`). The Store re-signs during certification, so this signature only exists to satisfy `signtool.exe` during the build.
+
 ## What's new in 1.0.9
 
 A targeted hardening pass after a 10-lens adversarial audit. Most items are invisible if everything was already working — the value is in the failure modes that no longer happen.
