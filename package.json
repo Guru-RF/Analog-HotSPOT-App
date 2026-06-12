@@ -1,7 +1,7 @@
 {
   "name": "hotspot-app",
   "productName": "HotSpot",
-  "version": "1.0.10",
+  "version": "1.0.11",
   "description": "HotSpot — Desktop App for Mac, Windows and Linux (BLE feed viewer)",
   "main": "main.js",
   "scripts": {
@@ -74,7 +74,7 @@
       "publisher": "CN=FBF35633-D0C5-410A-883E-75B3C38AB746",
       "publisherDisplayName": "RF Guru",
       "applicationId": "HotSpot",
-      "displayName": "SVXLink HotSpot",
+      "displayName": "SVXLink-HotSpot",
       "backgroundColor": "#0b1220",
       "languages": [
         "en-US"

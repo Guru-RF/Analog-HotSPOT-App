@@ -23,6 +23,10 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.11
+
+- AppX manifest `Package/Properties/DisplayName` set to **SVXLink-HotSpot** (matches the reserved Store name; the previous "SVXLink HotSpot" with a space wasn't reserved and was rejected at upload). AppX-only change — the NSIS / macOS / Linux builds still ship as **HotSpot**.
+
 ## What's new in 1.0.10
 
 - **Microsoft Store packages.** Each release now ships `HotSpot-x64.appx` and `HotSpot-arm64.appx` alongside the NSIS installers. These match the **RFGuru.SVXLink-HotSpot** identity registered in Partner Center and are ready to upload to the Microsoft Store submission flow.
