@@ -64,7 +64,10 @@
         }
       ],
       "artifactName": "${productName}-Setup-${arch}.${ext}",
-      "icon": "build/icon.png"
+      "icon": "build/icon.png",
+      "signtoolOptions": {
+        "sign": "./build/win-sign.js"
+      }
     },
     "appx": {
       "identityName": "RFGuru.SVXLink-HotSpot",
