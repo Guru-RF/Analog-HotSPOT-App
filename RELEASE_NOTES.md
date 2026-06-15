@@ -23,6 +23,10 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.13
+
+- AppX manifest `Package/Properties/PublisherDisplayName` set to **Diëlectricum** (matches the Partner Center publisher display name; the previous "RF Guru" was rejected at upload validation). AppX-only — `productName`, `author`, and the about/footer copy on the macOS / Linux / NSIS builds keep showing **RF.Guru** / **HotSpot**.
+
 ## What's new in 1.0.12
 
 - AppX tile asset set generated from the 1024×1024 product icon so the Windows Start menu / Search results / Store listing show the actual SVXLink-HotSpot logo instead of electron-builder's placeholder tile. Resolves Microsoft Store certification policy **10.1.1.11 On Device Tiles** ("tile icons must uniquely represent product"). AppX-only — no behaviour change to the NSIS / macOS / Linux builds.
