@@ -23,6 +23,13 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.14
+
+- **Windows Bluetooth fix.**
+  - **Microsoft Store (AppX) build:** the AppX manifest now declares `<DeviceCapability Name="bluetooth.genericAttributeProfile">`. Without it the MSIX sandbox blocked Chromium's Web Bluetooth from talking to the WinRT BLE APIs, so `requestDevice()` silently returned no devices on Store installs while the NSIS sideload worked. Injected via a build-time `build/patch-appx-template.js` script that edits the upstream electron-builder AppX template (electron-builder v25 has no public knob for `<Capabilities>` content).
+  - **All Windows builds:** `device.gatt.connect()` is now wrapped in a 25 s watchdog. A dismissed Windows pairing dialog or a stale bond used to leave the renderer's `ble.scanning` flag stuck at `true` forever — the re-entrancy guard in `bleConnect` would then silently swallow every subsequent Connect click. The flag is now released in a `finally` block, and the re-entrancy guard surfaces "Still connecting — please wait…" so the user gets feedback instead of a wedged button. On timeout the half-connected GATT is torn down and a "Pairing took too long — check Windows Bluetooth settings, then retry" message is shown.
+- No behaviour change on macOS or Linux (the watchdog never fires on the existing fast paths; the AppX manifest edit is Windows-only).
+
 ## What's new in 1.0.13
 
 - AppX manifest `Package/Properties/PublisherDisplayName` set to **Diëlectricum** (matches the Partner Center publisher display name; the previous "RF Guru" was rejected at upload validation). AppX-only — `productName`, `author`, and the about/footer copy on the macOS / Linux / NSIS builds keep showing **RF.Guru** / **HotSpot**.

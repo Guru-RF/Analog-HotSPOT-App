@@ -1,7 +1,7 @@
 {
   "name": "hotspot-app",
   "productName": "HotSpot",
-  "version": "1.0.13",
+  "version": "1.0.14",
   "description": "HotSpot — Desktop App for Mac, Windows and Linux (BLE feed viewer)",
   "main": "main.js",
   "scripts": {
@@ -9,7 +9,7 @@
     "build:mac": "electron-builder --mac",
     "build:linux": "electron-builder --linux",
     "build:win": "electron-builder --win nsis --x64 --arm64",
-    "build:win:appx": "electron-builder --win appx --x64 --arm64"
+    "build:win:appx": "node build/patch-appx-template.js && electron-builder --win appx --x64 --arm64"
   },
   "build": {
     "appId": "com.gururf.hotspot-app",

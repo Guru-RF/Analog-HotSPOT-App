@@ -760,6 +760,19 @@ setInterval(() => {
   if (!connected && !busy) scheduleReconnect(500);
 }, 15000);
 
+// Race a promise against a deadline. On timeout we reject with a labelled
+// Error and let the catch decide cleanup — the inner awaits don't know how
+// to disconnect the partially-set-up GATT, but the bleConnect catch does.
+// Used to bound device.gatt.connect() on Windows, where the WinRT BLE stack
+// can stall the promise indefinitely if the pairing dialog is dismissed.
+function bleWithTimeout(promise, ms, label) {
+  let timer;
+  const timeout = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+  });
+  return Promise.race([promise, timeout]).finally(() => clearTimeout(timer));
+}
+
 async function bleConnect() {
   if (!navigator.bluetooth) {
     setBleStatus("Web Bluetooth not available", "error");
@@ -767,8 +780,13 @@ async function bleConnect() {
   }
   // Re-entrancy guard — a second click while the first requestDevice() is
   // still pending would clobber characteristics mid-scan AND produce two
-  // concurrent Web Bluetooth requests, orphaning the first.
-  if (ble.scanning) return;
+  // concurrent Web Bluetooth requests, orphaning the first. Surface a status
+  // so the user gets feedback that the click was received — the silent
+  // return previously looked identical to a wedged button.
+  if (ble.scanning) {
+    setBleStatus("Still connecting — please wait…", "connecting");
+    return;
+  }
   ble.scanning = true;
 
   // Reset picker state at scan entry so the empty-state copy starts at
@@ -790,13 +808,14 @@ async function bleConnect() {
   // notification handlers from a previous connection cycle).
   if (ble.abort) { try { ble.abort.abort(); } catch (_) {} ble.abort = null; }
   const gen = ++ble.generation;
+  let device = null;
 
   try {
     setBleStatus("Scanning…", "connecting");
-    const device = await navigator.bluetooth.requestDevice({
+    device = await navigator.bluetooth.requestDevice({
       filters: [{ services: [BLE_SVC_UUID] }],
     });
-    if (gen !== ble.generation) { ble.scanning = false; return; }
+    if (gen !== ble.generation) return;
 
     setBleStatus(`Connecting to ${device.name || "device"}…`, "connecting");
     // The next bleSetupCharacteristics call creates ble.abort; bind the
@@ -816,9 +835,11 @@ async function bleConnect() {
       }
     });
 
-    await bleSetupCharacteristics(device, gen);
-    if (gen !== ble.generation) { ble.scanning = false; return; }
-    ble.scanning = false;
+    // 25 s budget covers a slow Windows pair (15-20 s observed) plus headroom
+    // for service/characteristic discovery. Without this, a dismissed pairing
+    // dialog or a stale bond used to wedge ble.scanning=true indefinitely.
+    await bleWithTimeout(bleSetupCharacteristics(device, gen), 25000, "GATT connect");
+    if (gen !== ble.generation) return;
     // ForgetSavedDevice may have fired while the GATT connect was in flight;
     // honour the user's intent and DON'T silently re-save the id they just
     // removed. forgetSavedDevice() sets ble.forgetPending = true.
@@ -827,10 +848,14 @@ async function bleConnect() {
     setBleStatus(device.name || "Connected", "connected");
     startKeepalive();
   } catch (err) {
-    ble.scanning = false;
     console.error("BLE connect failed:", err);
     const msg = err.message || "Connect failed";
     const cancelled = /cancel/i.test(msg) || err.name === "NotFoundError";
+    const timedOut = /timed out/i.test(msg);
+    // Stop the half-connected GATT so the next Connect click starts clean.
+    if (timedOut && device?.gatt) {
+      try { device.gatt.disconnect(); } catch (_) {}
+    }
     // Picker stays visible so the user can retry without re-triggering the
     // whole scan loop. Clear the spinner so other tiles re-enable. Flip to
     // the "scan ended" empty state on a cancelled / 30 s NotFoundError, even
@@ -841,7 +866,17 @@ async function bleConnect() {
       if (cancelled) picker.scanEnded = true;
       renderBlePicker();
     }
-    setBleStatus(cancelled ? "Not connected" : msg, cancelled ? "" : "error");
+    if (timedOut) {
+      setBleStatus("Pairing took too long — check Windows Bluetooth settings, then retry", "error");
+    } else {
+      setBleStatus(cancelled ? "Not connected" : msg, cancelled ? "" : "error");
+    }
+  } finally {
+    // Always release the re-entrancy guard. Previously this lived only on
+    // the happy-path and catch branches, so any unexpected throw (or the
+    // new timeout above) could leave ble.scanning=true forever and the
+    // guard at the top of bleConnect would silently swallow every retry.
+    ble.scanning = false;
   }
 }
 
