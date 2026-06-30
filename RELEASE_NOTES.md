@@ -23,6 +23,12 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.16
+
+- **macOS Bluetooth discovery, take 2.** The picker fix in 1.0.15 made the empty "Looking…" state visible, but the underlying scan still returned zero devices on macOS — Chromium's Web Bluetooth on Core Bluetooth doesn't reliably match the `services` filter against UUIDs that the HotSpot firmware does include in its primary advertisement, even though the iOS Flutter app discovers the same peripheral fine with the same filter. The desktop renderer now switches to `acceptAllDevices: true` + `optionalServices: [HotSpot UUID]` on macOS only. Windows and Linux keep the strict services filter.
+- **Main-process post-filter.** With the broad scan on macOS, every nameless BLE peripheral in range (AirPods, Apple Watch, beacons) would otherwise drown the picker. Devices without a Bluetooth Local Name are dropped before they reach the picker AND before the silent auto-connect-on-single-match path runs, so the picker shows the HotSpot's hostname alongside any other named peripherals you're carrying.
+- **Updated picker hint.** The macOS empty-state copy now mentions both Bluetooth permission and the HotSpot's hostname requirement.
+
 ## What's new in 1.0.15
 
 - **macOS Bluetooth picker fix.** On macOS, Chromium's `select-bluetooth-device` event only fires once a peripheral matches the service-UUID filter. With zero HotSpots in range — common during a first attempt while the OS Bluetooth permission prompt is still pending — the event never fired, the picker never opened, and the user was stuck on "Scanning…" with no Cancel button. The renderer now drives the picker independently of main.js: it opens after 3.5 s with a "Looking for HotSpots…" state and flips to "No HotSpots found in range" with a Rescan button at 30 s. On macOS the empty state also points the user at **System Settings → Privacy & Security → Bluetooth** so the permission gate is easy to spot.

@@ -55,8 +55,19 @@ function clearBleTimers() {
 }
 function pushBleCandidates() {
   if (!mainWindow || mainWindow.isDestroyed()) return;
+  // On darwin the renderer requests with acceptAllDevices (workaround for the
+  // Chromium services-filter mismatch against advertised UUIDs on Core
+  // Bluetooth). Without a post-filter the picker would surface every
+  // unnamed BLE peripheral in range — AirPods, Apple Watch, smart bulbs,
+  // beacons — and the user would lose their HotSpot in the noise. The
+  // firmware advertises a non-empty Local Name (truncated hostname, 1-8
+  // chars), so dropping zero-length names leaves the HotSpot and a few
+  // other named peripherals the user can easily identify.
+  const filtered = process.platform === "darwin"
+    ? bleLatestDevices.filter((d) => (d.deviceName || "").length > 0)
+    : bleLatestDevices;
   mainWindow.webContents.send("ble:candidates", {
-    devices: bleLatestDevices.map((d) => ({
+    devices: filtered.map((d) => ({
       deviceId: d.deviceId,
       deviceName: d.deviceName || "",
     })),
@@ -72,7 +83,12 @@ function resolveBleCallback(deviceId) {
 }
 function decideBleAfterResolution() {
   bleResolutionTimeout = null;
-  const list = bleLatestDevices;
+  // Same darwin name-filter as pushBleCandidates: with acceptAllDevices on
+  // macOS we could otherwise silently auto-connect to an unrelated nameless
+  // BLE peripheral that happens to be the single device in range.
+  const list = process.platform === "darwin"
+    ? bleLatestDevices.filter((d) => (d.deviceName || "").length > 0)
+    : bleLatestDevices;
   if (list.length === 1) {
     const only = list[0];
     if (!preferredBleId || only.deviceId === preferredBleId) {

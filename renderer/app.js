@@ -864,9 +864,24 @@ async function bleConnect() {
 
   try {
     setBleStatus("Scanning…", "connecting");
-    device = await navigator.bluetooth.requestDevice({
-      filters: [{ services: [BLE_SVC_UUID] }],
-    });
+    // macOS-only workaround. Chromium's Web Bluetooth on Core Bluetooth
+    // doesn't reliably match the `services` filter against UUIDs that the
+    // peripheral DOES advertise in its primary AD record (verified: the
+    // HotSpot firmware uses `btmgmt add-adv -u <svc-uuid> 1` and the
+    // iOS / Android Flutter app discovers the same device with the same
+    // service-UUID filter). The chooser handler in main.js then receives
+    // zero devices, the renderer picker stays in its empty "Looking…"
+    // state forever. Switching to acceptAllDevices on darwin bypasses
+    // Chromium's broken filter matching entirely; we keep the service
+    // UUID in optionalServices so the post-pick GATT path still works.
+    // main.js drops nameless peripherals so the picker isn't drowned in
+    // AirPods / Apple Watch noise.
+    const isMacOS = /Mac OS X|macOS/i.test(navigator.userAgent || "");
+    device = await navigator.bluetooth.requestDevice(
+      isMacOS
+        ? { acceptAllDevices: true, optionalServices: [BLE_SVC_UUID] }
+        : { filters: [{ services: [BLE_SVC_UUID] }] },
+    );
     if (gen !== ble.generation) return;
 
     setBleStatus(`Connecting to ${device.name || "device"}…`, "connecting");
@@ -1020,8 +1035,11 @@ function renderBlePicker() {
 
   if (picker.candidates.length === 0) {
     const isMacOS = /Mac OS X|macOS/i.test(navigator.userAgent || "");
+    // macOS hint covers both failure modes: (1) Bluetooth permission denied,
+    // and (2) the macOS broad-scan workaround surfacing only named devices —
+    // if the HotSpot's hostname is empty for some reason, it won't show up.
     const macHint = isMacOS
-      ? `<div class="ble-picker-empty-sub">On macOS, allow Bluetooth for <strong>HotSpot</strong> in <strong>System Settings → Privacy &amp; Security → Bluetooth</strong>.</div>`
+      ? `<div class="ble-picker-empty-sub">macOS: check that Bluetooth is allowed for <strong>HotSpot</strong> under <strong>System Settings → Privacy &amp; Security → Bluetooth</strong>, and that the HotSpot's Bluetooth name (hostname) is set.</div>`
       : "";
     if (picker.scanEnded) {
       list.innerHTML = `
