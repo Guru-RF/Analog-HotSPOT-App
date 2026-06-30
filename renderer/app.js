@@ -544,6 +544,34 @@ const ble = {
   abort: null,
 };
 
+// Renderer-driven picker timers. The picker used to wait for main.js to push
+// ble:candidates before opening, but on macOS the underlying chrome
+// chooser's select-bluetooth-device event only fires when a peripheral
+// matches the filter — so when zero HotSpots are in range, the picker
+// silently never appeared and the user was stuck on "Scanning…" forever.
+// These timers drive the picker independently of main.js so the UX matches
+// the mobile app's behaviour (mobile uses flutter_blue_plus which actively
+// polls regardless of detection events).
+//
+// pickerEagerTimer: opens the picker after a short delay if main.js hasn't
+//   already pushed candidates (preserves the silent-auto-connect-to-saved
+//   path's no-flash UX when a known hotspot is in range).
+// pickerScanEndTimer: after 30 s with no candidates, flips the picker into
+//   the "No HotSpots found in range" empty state with a Rescan button.
+let pickerEagerTimer = null;
+let pickerScanEndTimer = null;
+// 3.5 s sits past main.js's BLE_RESOLUTION_WINDOW_MS (3 s) so the silent
+// auto-connect-to-saved-device path doesn't flash the picker on the way
+// through. On platforms where main.js's chooser event never fires, this is
+// the only thing that opens the picker.
+const PICKER_EAGER_OPEN_MS = 3500;
+const PICKER_SCAN_END_MS   = 30000;
+
+function clearPickerScanTimers() {
+  if (pickerEagerTimer)   { clearTimeout(pickerEagerTimer);   pickerEagerTimer = null; }
+  if (pickerScanEndTimer) { clearTimeout(pickerScanEndTimer); pickerScanEndTimer = null; }
+}
+
 function getSavedDeviceName() {
   try { return localStorage.getItem(BLE_LAST_DEVICE) || ""; }
   catch { return ""; }
@@ -810,6 +838,30 @@ async function bleConnect() {
   const gen = ++ble.generation;
   let device = null;
 
+  // Eagerly open the picker after a short delay. If main.js's select-
+  // bluetooth-device event fires before the delay (devices in range), that
+  // handler will already have set picker.visible via ble:candidates and
+  // this is a no-op. If the event never fires (the macOS no-HotSpots case),
+  // we open the picker ourselves so the user has a visible "Looking…"
+  // state and a Cancel button instead of a silent stuck "Scanning…".
+  clearPickerScanTimers();
+  pickerEagerTimer = setTimeout(() => {
+    pickerEagerTimer = null;
+    if (!picker.visible && ble.scanning) {
+      showBlePicker({ devices: [], preferredId: getSavedDeviceId() });
+    }
+  }, PICKER_EAGER_OPEN_MS);
+  // After 30 s, flip the empty state to "No HotSpots found" so the user
+  // can hit Rescan instead of waiting indefinitely. Independent of main.js
+  // bleScanTimeout (which only arms if select-bluetooth-device fired).
+  pickerScanEndTimer = setTimeout(() => {
+    pickerScanEndTimer = null;
+    if (picker.visible && picker.candidates.length === 0 && !picker.selectedId) {
+      picker.scanEnded = true;
+      renderBlePicker();
+    }
+  }, PICKER_SCAN_END_MS);
+
   try {
     setBleStatus("Scanning…", "connecting");
     device = await navigator.bluetooth.requestDevice({
@@ -877,6 +929,7 @@ async function bleConnect() {
     // new timeout above) could leave ble.scanning=true forever and the
     // guard at the top of bleConnect would silently swallow every retry.
     ble.scanning = false;
+    clearPickerScanTimers();
   }
 }
 
@@ -966,12 +1019,17 @@ function renderBlePicker() {
   }
 
   if (picker.candidates.length === 0) {
+    const isMacOS = /Mac OS X|macOS/i.test(navigator.userAgent || "");
+    const macHint = isMacOS
+      ? `<div class="ble-picker-empty-sub">On macOS, allow Bluetooth for <strong>HotSpot</strong> in <strong>System Settings → Privacy &amp; Security → Bluetooth</strong>.</div>`
+      : "";
     if (picker.scanEnded) {
       list.innerHTML = `
         <div class="ble-picker-empty">
           <div class="ble-picker-empty-icon">📡</div>
           <div class="ble-picker-empty-title">No HotSpots found in range.</div>
           <div class="ble-picker-empty-sub">Make sure your HotSpot is powered on, then click <strong>Rescan</strong>.</div>
+          ${macHint}
         </div>`;
     } else {
       list.innerHTML = `
@@ -979,6 +1037,7 @@ function renderBlePicker() {
           <div class="ble-picker-empty-icon">🔍</div>
           <div class="ble-picker-empty-title">Looking for HotSpots in range…</div>
           <div class="ble-picker-empty-sub">Make sure your HotSpot is powered on and not already connected to another device.</div>
+          ${macHint}
         </div>`;
     }
     return;
@@ -1046,6 +1105,13 @@ function hideBlePicker() {
   picker.candidates = [];
   picker.scanEnded = false;
   renderBlePicker();
+  // Drop the renderer scan timers and release the re-entrancy guard so the
+  // user can click Connect again immediately. If requestDevice() is still
+  // pending under the covers (e.g. macOS where select-bluetooth-device
+  // never fired), a late resolve will be discarded silently by the
+  // generation-counter check inside bleConnect.
+  clearPickerScanTimers();
+  ble.scanning = false;
   if (wasVisible && pickerPrevFocus && typeof pickerPrevFocus.focus === "function") {
     try { pickerPrevFocus.focus(); } catch (_) {}
   }

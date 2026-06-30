@@ -442,6 +442,12 @@ function clampBoundsToDisplay(bounds, defaults) {
 // If the tag (stripped of its leading "v") is higher than app.getVersion(),
 // the renderer is told to show a red "update available" pill in the title
 // bar. Click → main process opens the landing page in the system browser.
+//
+// Only runs on Linux — Windows users get updates via the Microsoft Store
+// (AppX) and macOS users via the Mac App Store / pkg distribution. On those
+// platforms the in-app pill would just compete with the OS-level updater.
+// The handlers below stay registered (they're cheap no-ops without a fresh
+// checkForUpdates call) so removing the renderer-side update UI is optional.
 const UPDATE_CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
 const UPDATE_RELEASES_URL = "https://api.github.com/repos/Guru-RF/Analog-HotSPOT-App/releases/latest";
 const UPDATE_LANDING_URL = "https://svxlink-hotspot.app";
@@ -472,6 +478,8 @@ function isNewerVersion(remote, local) {
 let cachedUpdateAvailable = null;
 
 async function checkForUpdates() {
+  // Store-managed platforms — skip the GitHub poll entirely.
+  if (process.platform !== "linux") return;
   let res;
   const ac = new AbortController();
   const tmo = setTimeout(() => ac.abort(), 15000);
@@ -856,11 +864,16 @@ ipcMain.on("ble:preferred-id", (_event, id) => {
   preferredBleId = id || "";
 });
 
-// Renderer's picker UI sends one of these in response to a `ble:candidates`
-// push. `choose` resolves the still-pending requestDevice() callback with
-// the selected deviceId; `cancel` resolves it with "" to abort the scan.
+// Renderer's picker UI sends one of these. `choose` resolves the still-
+// pending requestDevice() callback with the selected deviceId; `cancel`
+// resolves it with "" to abort the scan. The `blePickerActive` flag used
+// to gate both handlers, but the renderer now opens the picker eagerly
+// (so the user sees a "Looking…" state even on macOS where Chromium's
+// select-bluetooth-device event only fires when a peripheral matches the
+// filter — zero matches → no event → previously no picker either). We
+// resolve unconditionally; resolveBleCallback is safe when there's no
+// pending callback (`if (cb)` guard inside).
 ipcMain.on("ble:choose", (_event, deviceId) => {
-  if (!blePickerActive) return;
   // The candidate list can change between render and click — a peripheral
   // that went away during the user's reaction time would no longer be in
   // `bleLatestDevices`. Resolving with a stale id makes Chromium reject
@@ -870,7 +883,6 @@ ipcMain.on("ble:choose", (_event, deviceId) => {
   resolveBleCallback(known ? deviceId : "");
 });
 ipcMain.on("ble:cancel-scan", () => {
-  if (!blePickerActive) return;
   resolveBleCallback("");
 });
 // "Forget HotSpot" → clear the saved id so the next scan opens the picker

@@ -23,6 +23,13 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.15
+
+- **macOS Bluetooth picker fix.** On macOS, Chromium's `select-bluetooth-device` event only fires once a peripheral matches the service-UUID filter. With zero HotSpots in range — common during a first attempt while the OS Bluetooth permission prompt is still pending — the event never fired, the picker never opened, and the user was stuck on "Scanning…" with no Cancel button. The renderer now drives the picker independently of main.js: it opens after 3.5 s with a "Looking for HotSpots…" state and flips to "No HotSpots found in range" with a Rescan button at 30 s. On macOS the empty state also points the user at **System Settings → Privacy & Security → Bluetooth** so the permission gate is easy to spot.
+- **Cancel in the picker now always frees the Connect button.** Previously a stuck-pending `requestDevice()` (e.g. the same macOS no-event case) could keep `ble.scanning=true` indefinitely; the next Connect click then silently no-op'd. The picker's cancel path now drops the guard immediately. A late `requestDevice()` resolve is still discarded silently by the generation-counter check.
+- **Multi-hotspot picker semantics unchanged.** When 2+ HotSpots are in range the picker shows the list with the saved one floated to the top under a "Last used" chip, exactly as the mobile sheet does. The auto-connect-if-single-saved-match silent path still applies, just with a deterministic Rescan fallback when discovery fails.
+- **Update notifier disabled on Windows and macOS.** The daily GitHub poll only runs on Linux now. Store-distributed builds (Microsoft Store on Windows, App Store / pkg on macOS) get updates through the OS-level updater, so the in-app red pill was redundant. Linux AppImage users still get the notifier.
+
 ## What's new in 1.0.14
 
 - **Windows Bluetooth fix.**
