@@ -17,6 +17,13 @@ const BLE_WRITE_UUID  = "6b1d6a11-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_STATUS_UUID = "6b1d6a12-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_CMD_UUID    = "6b1d6a13-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_FEED_UUID   = "6b1d6a14-c50f-4d86-a7f3-7f2a3a1b2c3d";
+// dtmfConfig — read-once JSON `{ mt, ct, cr }` cached on connect and spliced
+// into every feed-notify frame so the renderer's f.mt / f.ct / f.cr paths
+// stay shape-compatible. Mobile firmware moved these fields off the feed
+// notify because iOS ATT MTU caps notify frames at ~185 B; desktop BlueZ
+// negotiates a higher MTU so the field can still travel on the notify, but
+// the config characteristic is the source of truth.
+const BLE_CONFIG_UUID = "6b1d6a15-c50f-4d86-a7f3-7f2a3a1b2c3d";
 const BLE_CCCD_UUID   = "00002902-0000-1000-8000-00805f9b34fb";
 
 const HISTORY_KEY        = "ahs-app-talker-history-v1";
@@ -478,17 +485,32 @@ function renderInfo() {
     mtCard.style.display = "none";
   }
 
-  // CTCSS mappings
+  // Input CTCSS row — two modes, chosen by which config field is populated:
+  //   ct  → CTCSS-to-TG mode.  Title "Input CTCSS → TG",  rows = per-tone
+  //         mappings parsed from the "ctcss:tg,ctcss:tg,…" string.
+  //   cr  → DTMF-dial mode.    Title "Input CTCSS → DTMF", body = single
+  //         verbatim "Tone → {cr} Hz" row (cr may be a single freq like
+  //         "88.5" OR a tx/rx pair like "67.0,88.5"; do NOT try to parse
+  //         as ctcss:tg pairs — the format is user-facing raw).
+  //   neither → hide the card entirely.
+  // ct wins when both are set.
   const mappings = parseCtcssMappings(f.ct);
-  const ctCard = document.getElementById("info-ctcss");
-  const ctRows = document.getElementById("info-ctcss-rows");
+  const crRaw = String(f.cr || "").trim();
+  const ctCard  = document.getElementById("info-ctcss");
+  const ctTitle = document.getElementById("info-ctcss-title");
+  const ctRows  = document.getElementById("info-ctcss-rows");
   if (mappings.length) {
     ctCard.style.display = "";
+    if (ctTitle) ctTitle.textContent = "Input CTCSS → TG";
     ctRows.innerHTML = mappings.map((m) => {
       const label = state.talkgroupInfo[m.tg];
       const tgLabel = label ? `TG ${m.tg} · ${label}` : `TG ${m.tg}`;
       return `<div class="info-ctcss-row"><span class="mono">${escapeHtml(m.ctcss)} Hz</span><span>→</span><span>${escapeHtml(tgLabel)}</span></div>`;
     }).join("");
+  } else if (crRaw) {
+    ctCard.style.display = "";
+    if (ctTitle) ctTitle.textContent = "Input CTCSS → DTMF";
+    ctRows.innerHTML = `<div class="info-ctcss-row"><span>Tone</span><span>→</span><span class="mono">${escapeHtml(crRaw)} Hz</span></div>`;
   } else {
     ctCard.style.display = "none";
   }
@@ -684,6 +706,29 @@ async function bleSetupCharacteristics(device, generation) {
   let feedChar = null;
   try { feedChar = await service.getCharacteristic(BLE_FEED_UUID); } catch (_) {}
 
+  // dtmfConfig — read once after service discovery, cache the {mt, ct, cr}
+  // JSON so the feed-notify handler can splice the fields back into every
+  // frame. The characteristic is optional (older firmware doesn't expose
+  // it); on that path the feed-notify still carries mt / ct in-band and
+  // the splice below no-ops (json.mt ?? cfg.mt ?? "" keeps the notify
+  // value when present).
+  ble.dtmfConfig = { mt: "", ct: "", cr: "" };
+  try {
+    const configChar = await service.getCharacteristic(BLE_CONFIG_UUID);
+    const dv = await configChar.readValue();
+    if (generation !== ble.generation) return;
+    const parsed = JSON.parse(new TextDecoder().decode(dv));
+    ble.dtmfConfig = {
+      mt: typeof parsed.mt === "string" ? parsed.mt : "",
+      ct: typeof parsed.ct === "string" ? parsed.ct : "",
+      cr: typeof parsed.cr === "string" ? parsed.cr : "",
+    };
+  } catch (_) {
+    // Characteristic absent (old firmware) or read failed — leave the
+    // defaults in place. Feed notify may still carry mt/ct, and cr will
+    // simply be empty until the firmware ships it.
+  }
+
   // Tear down any prior connection's listeners. Mobile flutter_blue_plus
   // re-creates the characteristic object on every connect; Web Bluetooth in
   // Chromium reuses the SAME characteristic object across GATT reconnects to
@@ -711,7 +756,19 @@ async function bleSetupCharacteristics(device, generation) {
       const text = new TextDecoder().decode(e.target.value);
       try {
         const json = JSON.parse(text);
-        ingestFeed(json);
+        // Splice cached dtmfConfig fields onto the frame so the renderer's
+        // f.mt / f.ct / f.cr consumers see the same shape whether the
+        // firmware sends these in-band (older) or off-notify (mobile fix).
+        // json.* wins when present so notify-carried updates aren't shadowed
+        // by a stale cache; ?? cfg.* means only null/undefined trigger the
+        // fallback — an explicit "" from the firmware still wins.
+        const cfg = ble.dtmfConfig || {};
+        ingestFeed({
+          ...json,
+          mt: json.mt ?? cfg.mt ?? "",
+          ct: json.ct ?? cfg.ct ?? "",
+          cr: json.cr ?? cfg.cr ?? "",
+        });
       } catch (err) {
         console.warn("Feed parse failed:", err, text);
       }

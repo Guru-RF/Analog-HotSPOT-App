@@ -23,6 +23,16 @@ A minimal desktop companion for the Analog HotSpot SVXLink box.
 | Windows | `.exe` (NSIS installer, x64) |
 | Linux | `.AppImage` (x64 + arm64) |
 
+## What's new in 1.0.17
+
+- **New `dtmfConfig` BLE characteristic** (`6b1d6a15-…`, read-only) — read once on connect after service discovery. Payload is the static per-session JSON `{ mt, ct, cr }` (monitored talkgroups, CTCSS→TG mappings, DTMF-dial CTCSS). The fields are spliced into every feed-notify frame before the renderer's `f.mt` / `f.ct` / `f.cr` consumers see it, so the shape stays unchanged. Firmware without the new characteristic keeps working — the read is optional and the notify-carried values win when present.
+- **New `cr` field** — CTCSS for DTMF-dial mode. Format: single frequency (`"88.5"`) or a comma-separated tx/rx pair (`"67.0,88.5"`). Not parsed; shown verbatim.
+- **Info-panel "Input CTCSS" row** — new picker logic:
+  - `ct` populated → **Input CTCSS → TG** with per-tone → talkgroup rows (existing behaviour).
+  - `cr` populated → **Input CTCSS → DTMF** with a single verbatim `Tone → {cr} Hz` row.
+  - Neither → the whole card is hidden.
+  - `ct` wins when both are set.
+
 ## What's new in 1.0.16
 
 - **macOS Bluetooth discovery, take 2.** The picker fix in 1.0.15 made the empty "Looking…" state visible, but the underlying scan still returned zero devices on macOS — Chromium's Web Bluetooth on Core Bluetooth doesn't reliably match the `services` filter against UUIDs that the HotSpot firmware does include in its primary advertisement, even though the iOS Flutter app discovers the same peripheral fine with the same filter. The desktop renderer now switches to `acceptAllDevices: true` + `optionalServices: [HotSpot UUID]` on macOS only. Windows and Linux keep the strict services filter.
